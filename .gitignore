@@ -1,0 +1,9 @@
+target/
+Cargo.lock
+.env
+*.swp
+.DS_Store
+
+# Generated eval artifacts (corpus_demo.json is the committed source corpus).
+eval/golden*.json
+eval/corpus.json

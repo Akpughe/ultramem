@@ -1,0 +1,32 @@
+# UltraMem quickstart: the API server + Qdrant. Provider keys come from .env
+# (copy .env.example → .env first).
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  ultramem:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - qdrant
+    ports:
+      - "8080:8080"
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ""
+      JINA_API_KEY: ${JINA_API_KEY}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      # Swappable embedder (Phase 3): "jina" (default) or "openai" + OPENAI_API_KEY.
+      ULTRAMEM_EMBEDDER: ${ULTRAMEM_EMBEDDER:-jina}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ULTRAMEM_API_KEY: ${ULTRAMEM_API_KEY}
+      PORT: "8080"
+
+volumes:
+  qdrant_data:

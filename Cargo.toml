@@ -1,0 +1,27 @@
+# UltraMem workspace. `ultramem-mcp` lives in its own repo (see docs/MCP.md).
+[workspace]
+resolver = "2"
+members = [
+    "crates/ultramem-core",
+    "crates/ultramem-server",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"            # decision: see docs/ROADMAP.md "Open decisions"
+repository = "https://github.com/Akpughe/ultramem"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+url = "2"
+futures-util = "0.3"
+async-trait = "0.1"
+dotenvy = "0.15"
+walkdir = "2"
+dirs = "5"
