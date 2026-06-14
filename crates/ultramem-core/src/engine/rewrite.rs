@@ -20,7 +20,12 @@ pub struct SearchPlan {
     pub listy: bool,
 }
 
-pub async fn plan(llm: &dyn Llm, model: &ResolvedModel, question: &str, context: Option<&str>) -> SearchPlan {
+pub async fn plan(
+    llm: &dyn Llm,
+    model: &ResolvedModel,
+    question: &str,
+    context: Option<&str>,
+) -> SearchPlan {
     let fallback = SearchPlan {
         query: question.to_string(),
         ..Default::default()
@@ -74,11 +79,7 @@ fn date_to_unix(s: &str, end_of_day: bool) -> Option<i64> {
     } else {
         d.and_hms_opt(0, 0, 0)?
     };
-    Some(
-        t.and_local_timezone(chrono::Local)
-            .earliest()?
-            .timestamp(),
-    )
+    Some(t.and_local_timezone(chrono::Local).earliest()?.timestamp())
 }
 
 fn parse_plan(raw: &str, question: &str) -> Option<SearchPlan> {
@@ -95,7 +96,11 @@ fn parse_plan(raw: &str, question: &str) -> Option<SearchPlan> {
     let after = v["after"].as_str().and_then(|s| date_to_unix(s, false));
     let before = v["before"].as_str().and_then(|s| date_to_unix(s, true));
     Some(SearchPlan {
-        query: if query.is_empty() { question.to_string() } else { query },
+        query: if query.is_empty() {
+            question.to_string()
+        } else {
+            query
+        },
         source,
         after,
         before,
@@ -122,7 +127,11 @@ mod tests {
 
     #[test]
     fn garbage_dates_become_no_window() {
-        let p = parse_plan(r#"{"query":"x","source":null,"after":"not-a-date","before":1781,"list":false}"#, "q").unwrap();
+        let p = parse_plan(
+            r#"{"query":"x","source":null,"after":"not-a-date","before":1781,"list":false}"#,
+            "q",
+        )
+        .unwrap();
         assert!(p.after.is_none() && p.before.is_none());
     }
 

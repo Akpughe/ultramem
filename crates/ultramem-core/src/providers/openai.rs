@@ -71,23 +71,41 @@ impl Embedder for OpenAiEmbedder {
                 .await
                 .map_err(|e| format!("openai embeddings unreachable: {e}"))?;
             let status = resp.status();
-            let v: Value = resp.json().await.map_err(|e| format!("openai bad response: {e}"))?;
+            let v: Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("openai bad response: {e}"))?;
             if !status.is_success() {
                 let detail = v["error"]["message"].as_str().unwrap_or("unknown");
                 return Err(format!("openai embeddings error {status}: {detail}"));
             }
-            let mut data: Vec<&Value> = v["data"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+            let mut data: Vec<&Value> = v["data"]
+                .as_array()
+                .map(|a| a.iter().collect())
+                .unwrap_or_default();
             if data.len() != batch.len() {
-                return Err(format!("openai returned {} embeddings for {} inputs", data.len(), batch.len()));
+                return Err(format!(
+                    "openai returned {} embeddings for {} inputs",
+                    data.len(),
+                    batch.len()
+                ));
             }
             data.sort_by_key(|d| d["index"].as_u64().unwrap_or(0));
             for d in data {
                 let vec: Vec<f32> = d["embedding"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_f64().map(|f| f as f32))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 if vec.len() != self.dim {
-                    return Err(format!("openai embedding dim {} != {}", vec.len(), self.dim));
+                    return Err(format!(
+                        "openai embedding dim {} != {}",
+                        vec.len(),
+                        self.dim
+                    ));
                 }
                 out.push(vec);
             }

@@ -59,20 +59,27 @@ impl Profile {
     }
 }
 
-const STATIC_SYSTEM: &str = "You compile a durable profile of a user from facts extracted from their \
+const STATIC_SYSTEM: &str =
+    "You compile a durable profile of a user from facts extracted from their \
 files, messages, and meetings. Keep only facts that are basically always true: who they are, their \
 role, the projects and products they work on, the people and companies around them, and standing \
 preferences. Drop one-off events, transient tasks, and anything dated. Write 4-10 terse bullet \
 points (each on its own line starting with '- '). No preamble.";
 
-const DYNAMIC_SYSTEM: &str = "You summarize what a user has been doing recently from facts extracted \
+const DYNAMIC_SYSTEM: &str =
+    "You summarize what a user has been doing recently from facts extracted \
 in the last week. Focus on active work, recent decisions, and current threads. Write 3-6 terse \
 bullet points (each on its own line starting with '- '). No preamble.";
 
 /// Compile the profile for one namespace from its latest memories. Either
 /// section may come back empty (no facts yet, or the model declined) — that's
 /// fine.
-pub async fn compile(store: &dyn VectorStore, llm: &dyn Llm, cfg: &EngineCfg, tag: &str) -> Result<Profile, String> {
+pub async fn compile(
+    store: &dyn VectorStore,
+    llm: &dyn Llm,
+    cfg: &EngineCfg,
+    tag: &str,
+) -> Result<Profile, String> {
     // Scroll a wider sample than we keep — points from other namespaces are
     // filtered out in Rust, so over-fetch to still get enough of ours.
     let points = store.scroll(&cfg.facts_collection, SAMPLE * 4).await?;
@@ -91,7 +98,9 @@ pub async fn compile(store: &dyn VectorStore, llm: &dyn Llm, cfg: &EngineCfg, ta
         if durable.len() >= SAMPLE {
             break;
         }
-        let Some(fact) = pl["fact"].as_str() else { continue };
+        let Some(fact) = pl["fact"].as_str() else {
+            continue;
+        };
         let ts = pl["captured_at"].as_i64().unwrap_or(0);
         durable.push(fact.to_string());
         if now - ts <= RECENT_WINDOW_SECS {
@@ -105,16 +114,31 @@ pub async fn compile(store: &dyn VectorStore, llm: &dyn Llm, cfg: &EngineCfg, ta
     }
 
     // Static section from durable facts (cap the prompt).
-    let durable_input = durable.iter().take(250).map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n");
-    let static_text = llm.chat(model, STATIC_SYSTEM, &durable_input, 0.2).await.unwrap_or_default();
+    let durable_input = durable
+        .iter()
+        .take(250)
+        .map(|f| format!("- {f}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let static_text = llm
+        .chat(model, STATIC_SYSTEM, &durable_input, 0.2)
+        .await
+        .unwrap_or_default();
 
     // Dynamic section from recent facts, newest first.
-    recent.sort_by(|a, b| b.0.cmp(&a.0));
+    recent.sort_by_key(|x| std::cmp::Reverse(x.0));
     let dynamic_text = if recent.is_empty() {
         String::new()
     } else {
-        let recent_input = recent.iter().take(80).map(|(_, f)| format!("- {f}")).collect::<Vec<_>>().join("\n");
-        llm.chat(model, DYNAMIC_SYSTEM, &recent_input, 0.2).await.unwrap_or_default()
+        let recent_input = recent
+            .iter()
+            .take(80)
+            .map(|(_, f)| format!("- {f}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        llm.chat(model, DYNAMIC_SYSTEM, &recent_input, 0.2)
+            .await
+            .unwrap_or_default()
     };
 
     Ok(Profile {
@@ -129,7 +153,10 @@ mod tests {
 
     #[test]
     fn prompt_block_omits_empty_sections() {
-        let p = Profile { static_text: "- works on Recally".into(), dynamic_text: String::new() };
+        let p = Profile {
+            static_text: "- works on Recally".into(),
+            dynamic_text: String::new(),
+        };
         let block = p.as_prompt_block();
         assert!(block.contains("always know"));
         assert!(!block.contains("recently"));
@@ -145,8 +172,14 @@ mod tests {
     fn in_tag_matches_and_claims_legacy() {
         use serde_json::json;
         // Exact tag match.
-        assert!(in_tag(&json!({ "container_tag": "tenant_42" }), "tenant_42"));
-        assert!(!in_tag(&json!({ "container_tag": "tenant_42" }), DEFAULT_TAG));
+        assert!(in_tag(
+            &json!({ "container_tag": "tenant_42" }),
+            "tenant_42"
+        ));
+        assert!(!in_tag(
+            &json!({ "container_tag": "tenant_42" }),
+            DEFAULT_TAG
+        ));
         // Legacy point (no field) belongs to the default namespace only.
         assert!(in_tag(&json!({ "fact": "x" }), DEFAULT_TAG));
         assert!(!in_tag(&json!({ "fact": "x" }), "tenant_42"));

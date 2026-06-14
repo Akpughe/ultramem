@@ -62,14 +62,20 @@ pub async fn distill_facts(
         match llm.chat(model, EXTRACT_SYSTEM, &user, 0.3).await {
             Ok(raw) => match parse_facts(&raw, MAX_FACTS_PER_SEGMENT) {
                 Some(facts) => all.extend(facts),
-                None => eprintln!("[recally] unparseable distill output for '{title}' part {}", i + 1),
+                None => eprintln!(
+                    "[recally] unparseable distill output for '{title}' part {}",
+                    i + 1
+                ),
             },
             // First segment failing means the doc got no extraction at all —
             // surface it so the caller can log. Later segments failing still
             // leaves partial coverage, which beats none.
             Err(e) if i == 0 => return Err(e),
             Err(e) => {
-                eprintln!("[recally] distill part {}/{total} failed for '{title}': {e}", i + 1);
+                eprintln!(
+                    "[recally] distill part {}/{total} failed for '{title}': {e}",
+                    i + 1
+                );
                 break; // likely rate-limited; keep what we have
             }
         }
@@ -138,7 +144,11 @@ mod tests {
 
     #[test]
     fn parses_plain_array() {
-        let facts = parse_facts(r#"["User is building a Tauri app", "The deadline is June 20"]"#, 10).unwrap();
+        let facts = parse_facts(
+            r#"["User is building a Tauri app", "The deadline is June 20"]"#,
+            10,
+        )
+        .unwrap();
         assert_eq!(facts.len(), 2);
     }
 

@@ -50,14 +50,24 @@ pub async fn jina(
         .await
         .map_err(|e| format!("jina reader unreachable: {e}"))?;
     let status = resp.status();
-    let v: serde_json::Value = resp.json().await.map_err(|e| format!("jina reader bad response: {e}"))?;
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("jina reader bad response: {e}"))?;
     if !status.is_success() {
         return Err(format!(
             "jina reader {status}: {}",
-            v["message"].as_str().or_else(|| v["readableMessage"].as_str()).unwrap_or("error")
+            v["message"]
+                .as_str()
+                .or_else(|| v["readableMessage"].as_str())
+                .unwrap_or("error")
         ));
     }
-    Ok(v["data"]["content"].as_str().unwrap_or("").trim().to_string())
+    Ok(v["data"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string())
 }
 
 /// Fetch and clean a web page's body as markdown via Jina Reader's URL mode
@@ -81,14 +91,24 @@ pub async fn jina_url(http: &reqwest::Client, key: &str, url: &str) -> Result<St
         .await
         .map_err(|e| format!("jina reader unreachable: {e}"))?;
     let status = resp.status();
-    let v: serde_json::Value = resp.json().await.map_err(|e| format!("jina reader bad response: {e}"))?;
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("jina reader bad response: {e}"))?;
     if !status.is_success() {
         return Err(format!(
             "jina reader url {status}: {}",
-            v["message"].as_str().or_else(|| v["readableMessage"].as_str()).unwrap_or("error")
+            v["message"]
+                .as_str()
+                .or_else(|| v["readableMessage"].as_str())
+                .unwrap_or("error")
         ));
     }
-    Ok(v["data"]["content"].as_str().unwrap_or("").trim().to_string())
+    Ok(v["data"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string())
 }
 
 /// Offline extraction: plain read for md/txt/csv, macOS `textutil` for Office

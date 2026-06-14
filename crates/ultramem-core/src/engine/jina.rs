@@ -37,7 +37,10 @@ pub async fn rerank(
         .await
         .map_err(|e| format!("jina rerank unreachable: {e}"))?;
     let status = resp.status();
-    let v: Value = resp.json().await.map_err(|e| format!("jina rerank bad response: {e}"))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("jina rerank bad response: {e}"))?;
     if !status.is_success() {
         let detail = v["detail"].as_str().unwrap_or("unknown");
         return Err(format!("jina rerank error {status}: {detail}"));
@@ -47,7 +50,10 @@ pub async fn rerank(
         .map(|arr| {
             arr.iter()
                 .filter_map(|r| {
-                    Some((r["index"].as_u64()? as usize, r["relevance_score"].as_f64()?))
+                    Some((
+                        r["index"].as_u64()? as usize,
+                        r["relevance_score"].as_f64()?,
+                    ))
                 })
                 .collect()
         })
@@ -75,7 +81,10 @@ pub async fn embed(
             .await
             .map_err(|e| format!("jina unreachable: {e}"))?;
         let status = resp.status();
-        let v: Value = resp.json().await.map_err(|e| format!("jina bad response: {e}"))?;
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("jina bad response: {e}"))?;
         if !status.is_success() {
             let detail = v["detail"]
                 .as_str()
@@ -83,16 +92,27 @@ pub async fn embed(
                 .unwrap_or("unknown");
             return Err(format!("jina error {status}: {detail}"));
         }
-        let mut data: Vec<&Value> = v["data"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+        let mut data: Vec<&Value> = v["data"]
+            .as_array()
+            .map(|a| a.iter().collect())
+            .unwrap_or_default();
         if data.len() != batch.len() {
-            return Err(format!("jina returned {} embeddings for {} inputs", data.len(), batch.len()));
+            return Err(format!(
+                "jina returned {} embeddings for {} inputs",
+                data.len(),
+                batch.len()
+            ));
         }
         // The API documents index-ordered results; sort defensively.
         data.sort_by_key(|d| d["index"].as_u64().unwrap_or(0));
         for d in data {
             let vec: Vec<f32> = d["embedding"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_f64().map(|f| f as f32))
+                        .collect()
+                })
                 .unwrap_or_default();
             if vec.len() != DIM {
                 return Err(format!("jina embedding dim {} != {DIM}", vec.len()));

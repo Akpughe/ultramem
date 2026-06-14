@@ -66,15 +66,25 @@ async fn main() {
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state);
 
-    let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.expect("bind");
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8080);
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .expect("bind");
     println!("[ultramem] listening on http://0.0.0.0:{port}");
     axum::serve(listener, app).await.expect("serve");
 }
 
 /// Bearer-key gate. When `ULTRAMEM_API_KEY` is set, every protected request must
 /// present `Authorization: Bearer <key>`.
-async fn auth(State(state): State<Arc<AppState>>, headers: HeaderMap, req: axum::extract::Request, next: Next) -> Response {
+async fn auth(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
     if state.api_key.is_empty() {
         return next.run(req).await; // unauthenticated mode (dev only)
     }
@@ -87,15 +97,25 @@ async fn auth(State(state): State<Arc<AppState>>, headers: HeaderMap, req: axum:
     if ok {
         next.run(req).await
     } else {
-        (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid or missing API key" }))).into_response()
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid or missing API key" })),
+        )
+            .into_response()
     }
 }
 
 fn err(e: String) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response()
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": e })),
+    )
+        .into_response()
 }
 fn tag_or_default(t: &Option<String>) -> String {
-    t.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_TAG.to_string())
+    t.clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_TAG.to_string())
 }
 
 // ── health ──────────────────────────────────────────────────────────────────
@@ -128,7 +148,9 @@ async fn add_memory(State(state): State<Arc<AppState>>, Json(b): Json<AddBody>) 
         container_tag: tag_or_default(&b.container_tag),
     };
     match state.engine.add_document(&doc).await {
-        Ok(document_id) => Json(json!({ "document_id": document_id, "status": "done" })).into_response(),
+        Ok(document_id) => {
+            Json(json!({ "document_id": document_id, "status": "done" })).into_response()
+        }
         Err(e) => err(e),
     }
 }
@@ -151,8 +173,14 @@ struct SearchBody {
 async fn search(State(state): State<Arc<AppState>>, Json(b): Json<SearchBody>) -> Response {
     let tag = tag_or_default(&b.container_tag);
     let limit = b.limit.unwrap_or(8).clamp(1, 50);
-    match state.engine.retrieve_tagged(&tag, &b.query, None, limit).await {
-        Ok((docs, memories)) => Json(json!({ "documents": docs, "memories": memories })).into_response(),
+    match state
+        .engine
+        .retrieve_tagged(&tag, &b.query, None, limit)
+        .await
+    {
+        Ok((docs, memories)) => {
+            Json(json!({ "documents": docs, "memories": memories })).into_response()
+        }
         Err(e) => err(e),
     }
 }
@@ -164,7 +192,10 @@ struct TagQuery {
 }
 
 async fn profile(State(state): State<Arc<AppState>>, Query(q): Query<TagQuery>) -> Response {
-    let p = state.engine.profile_tagged(&tag_or_default(&q.container_tag)).await;
+    let p = state
+        .engine
+        .profile_tagged(&tag_or_default(&q.container_tag))
+        .await;
     Json(json!({ "static": p.static_text, "dynamic": p.dynamic_text })).into_response()
 }
 
@@ -223,14 +254,26 @@ async fn reindex(State(state): State<Arc<AppState>>, Json(b): Json<ReindexBody>)
                     for (doc_id, title, source, reference, captured_at) in rows {
                         let _ = st
                             .engine
-                            .reindex_doc_facts(&doc_id, &title, &source, &reference, captured_at, &tag)
+                            .reindex_doc_facts(
+                                &doc_id,
+                                &title,
+                                &source,
+                                &reference,
+                                captured_at,
+                                &tag,
+                            )
                             .await;
                     }
                 });
-                Json(json!({ "ok": true, "mode": "facts", "total": total, "status": "running" })).into_response()
+                Json(json!({ "ok": true, "mode": "facts", "total": total, "status": "running" }))
+                    .into_response()
             }
             Err(e) => err(e),
         },
-        other => (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("unknown mode '{other}'") }))).into_response(),
+        other => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("unknown mode '{other}'") })),
+        )
+            .into_response(),
     }
 }

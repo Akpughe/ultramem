@@ -41,7 +41,14 @@ pub async fn doc_context(
     let user = format!("Title: {title}\n\n{head}");
     match llm.chat(model, SYSTEM, &user, 0.2).await {
         Ok(raw) => {
-            let line = raw.trim().trim_matches('"').lines().next().unwrap_or("").trim().to_string();
+            let line = raw
+                .trim()
+                .trim_matches('"')
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             // Guard against the model echoing instructions or returning junk.
             if line.len() >= 12 && line.chars().count() <= 240 {
                 Some(line)

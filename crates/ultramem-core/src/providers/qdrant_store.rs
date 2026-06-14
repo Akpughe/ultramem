@@ -16,7 +16,11 @@ pub struct QdrantStore {
 
 impl QdrantStore {
     pub fn new(url: impl Into<String>, key: impl Into<String>) -> Self {
-        Self { http: reqwest::Client::new(), url: url.into(), key: key.into() }
+        Self {
+            http: reqwest::Client::new(),
+            url: url.into(),
+            key: key.into(),
+        }
     }
 }
 
@@ -32,7 +36,8 @@ impl VectorStore for QdrantStore {
         qdrant::ensure_collection_hybrid(&self.http, &self.url, &self.key, name, dim).await
     }
     async fn ensure_payload_index(&self, collection: &str, field: &str, schema: &str) {
-        qdrant::ensure_payload_index(&self.http, &self.url, &self.key, collection, field, schema).await
+        qdrant::ensure_payload_index(&self.http, &self.url, &self.key, collection, field, schema)
+            .await
     }
     async fn upsert(&self, collection: &str, points: Vec<Value>) -> Result<(), String> {
         qdrant::upsert(&self.http, &self.url, &self.key, collection, points).await
@@ -45,7 +50,17 @@ impl VectorStore for QdrantStore {
         score_threshold: f32,
         filter: Option<Value>,
     ) -> Result<Vec<Value>, String> {
-        qdrant::search(&self.http, &self.url, &self.key, collection, vector, limit, score_threshold, filter).await
+        qdrant::search(
+            &self.http,
+            &self.url,
+            &self.key,
+            collection,
+            vector,
+            limit,
+            score_threshold,
+            filter,
+        )
+        .await
     }
     async fn search_hybrid(
         &self,
@@ -55,7 +70,10 @@ impl VectorStore for QdrantStore {
         limit: usize,
         filter: Option<Value>,
     ) -> Result<Vec<Value>, String> {
-        qdrant::search_hybrid(&self.http, &self.url, &self.key, collection, dense, sparse, limit, filter).await
+        qdrant::search_hybrid(
+            &self.http, &self.url, &self.key, collection, dense, sparse, limit, filter,
+        )
+        .await
     }
     async fn set_payload(
         &self,
@@ -63,7 +81,10 @@ impl VectorStore for QdrantStore {
         point_ids: &[String],
         payload: Value,
     ) -> Result<(), String> {
-        qdrant::set_payload(&self.http, &self.url, &self.key, collection, point_ids, payload).await
+        qdrant::set_payload(
+            &self.http, &self.url, &self.key, collection, point_ids, payload,
+        )
+        .await
     }
     async fn set_payload_by_filter(
         &self,
@@ -71,7 +92,10 @@ impl VectorStore for QdrantStore {
         filter: Value,
         payload: Value,
     ) -> Result<(), String> {
-        qdrant::set_payload_by_filter(&self.http, &self.url, &self.key, collection, filter, payload).await
+        qdrant::set_payload_by_filter(
+            &self.http, &self.url, &self.key, collection, filter, payload,
+        )
+        .await
     }
     async fn scroll(&self, collection: &str, limit: usize) -> Result<Vec<Value>, String> {
         qdrant::scroll(&self.http, &self.url, &self.key, collection, limit).await
@@ -98,7 +122,8 @@ impl VectorStore for QdrantStore {
         doc_id: &str,
         limit: usize,
     ) -> Result<Vec<(i64, String)>, String> {
-        qdrant::doc_chunks_indexed(&self.http, &self.url, &self.key, collection, doc_id, limit).await
+        qdrant::doc_chunks_indexed(&self.http, &self.url, &self.key, collection, doc_id, limit)
+            .await
     }
     async fn delete_by_filter(&self, collection: &str, filter: Value) -> Result<(), String> {
         qdrant::delete_by_filter(&self.http, &self.url, &self.key, collection, filter).await

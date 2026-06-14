@@ -14,7 +14,10 @@ pub struct JinaEmbedder {
 
 impl JinaEmbedder {
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self { http: reqwest::Client::new(), api_key: api_key.into() }
+        Self {
+            http: reqwest::Client::new(),
+            api_key: api_key.into(),
+        }
     }
 }
 
@@ -44,7 +47,10 @@ pub struct JinaReranker {
 
 impl JinaReranker {
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self { http: reqwest::Client::new(), api_key: api_key.into() }
+        Self {
+            http: reqwest::Client::new(),
+            api_key: api_key.into(),
+        }
     }
 }
 

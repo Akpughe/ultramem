@@ -37,8 +37,15 @@ fn split(url: &str) -> (String, Vec<String>, String) {
     let rest = url.split("://").nth(1).unwrap_or(url);
     let (host_path, query) = rest.split_once('?').unwrap_or((rest, ""));
     let mut parts = host_path.split('/');
-    let host = parts.next().unwrap_or_default().trim_start_matches("www.").to_lowercase();
-    let segs: Vec<String> = parts.filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+    let host = parts
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches("www.")
+        .to_lowercase();
+    let segs: Vec<String> = parts
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
     (host, segs, query.to_string())
 }
 
@@ -71,7 +78,13 @@ fn query_param(query: &str, name: &str) -> Option<String> {
 pub fn describe(url: &str, page_title: &str) -> (String, String) {
     let (host, segs, query) = split(url);
     let title = page_title.trim();
-    let titled = |fallback: String| if title.is_empty() { fallback } else { title.to_string() };
+    let titled = |fallback: String| {
+        if title.is_empty() {
+            fallback
+        } else {
+            title.to_string()
+        }
+    };
     let s = |i: usize| segs.get(i).map(String::as_str).unwrap_or("");
 
     let desc = match host.as_str() {
@@ -79,8 +92,13 @@ pub fn describe(url: &str, page_title: &str) -> (String, String) {
             let repo = format!("{}/{}", s(0), s(1));
             match s(2) {
                 "pull" => format!("GitHub pull request #{} in the {repo} repository", s(3)),
-                "issues" if !s(3).is_empty() => format!("GitHub issue #{} in the {repo} repository", s(3)),
-                "commit" => format!("GitHub commit {} in the {repo} repository", &s(3)[..s(3).len().min(10)]),
+                "issues" if !s(3).is_empty() => {
+                    format!("GitHub issue #{} in the {repo} repository", s(3))
+                }
+                "commit" => format!(
+                    "GitHub commit {} in the {repo} repository",
+                    &s(3)[..s(3).len().min(10)]
+                ),
                 "releases" => format!("GitHub releases for the {repo} repository"),
                 "tree" | "blob" => format!("File or folder in the GitHub repository {repo}"),
                 "" if segs.len() == 1 => format!("GitHub profile of {}", s(0)),
@@ -92,7 +110,10 @@ pub fn describe(url: &str, page_title: &str) -> (String, String) {
             if s(0) == "watch" || s(0) == "shorts" {
                 "YouTube video".into()
             } else if s(0) == "results" {
-                format!("YouTube search for \"{}\"", query_param(&query, "search_query").unwrap_or_default())
+                format!(
+                    "YouTube search for \"{}\"",
+                    query_param(&query, "search_query").unwrap_or_default()
+                )
             } else if let Some(handle) = segs.first().filter(|x| x.starts_with('@')) {
                 format!("YouTube channel {handle}")
             } else {
@@ -101,7 +122,10 @@ pub fn describe(url: &str, page_title: &str) -> (String, String) {
         }
         "youtu.be" => "YouTube video".into(),
         "google.com" if s(0) == "search" => {
-            format!("Google search for \"{}\"", query_param(&query, "q").unwrap_or_default())
+            format!(
+                "Google search for \"{}\"",
+                query_param(&query, "q").unwrap_or_default()
+            )
         }
         "stackoverflow.com" if s(0) == "questions" => "Stack Overflow question".into(),
         "x.com" | "twitter.com" => {
@@ -129,7 +153,9 @@ pub fn describe(url: &str, page_title: &str) -> (String, String) {
         _ => {
             let site = host.split('.').rev().nth(1).map(|s| {
                 let mut c = s.chars();
-                c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+                c.next()
+                    .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                    .unwrap_or_default()
             });
             format!("Page on {}", site.unwrap_or_else(|| host.clone()))
         }
@@ -148,18 +174,31 @@ mod tests {
             "https://github.com/500chaw/chowcentral-api-backend/pull/826",
             "fix(company-order): close gaps · Pull Request #826",
         );
-        assert_eq!(d, "GitHub pull request #826 in the 500chaw/chowcentral-api-backend repository");
+        assert_eq!(
+            d,
+            "GitHub pull request #826 in the 500chaw/chowcentral-api-backend repository"
+        );
     }
 
     #[test]
     fn github_repo_and_commit() {
-        assert_eq!(describe("https://github.com/qdrant/qdrant", "").1, "GitHub repository qdrant/qdrant");
-        assert!(describe("https://github.com/a/b/commit/abc123def456789", "").1.starts_with("GitHub commit abc123def4"));
+        assert_eq!(
+            describe("https://github.com/qdrant/qdrant", "").1,
+            "GitHub repository qdrant/qdrant"
+        );
+        assert!(
+            describe("https://github.com/a/b/commit/abc123def456789", "")
+                .1
+                .starts_with("GitHub commit abc123def4")
+        );
     }
 
     #[test]
     fn youtube_and_search_understood() {
-        assert_eq!(describe("https://www.youtube.com/watch?v=xyz", "Cool video").1, "YouTube video");
+        assert_eq!(
+            describe("https://www.youtube.com/watch?v=xyz", "Cool video").1,
+            "YouTube video"
+        );
         assert_eq!(
             describe("https://www.google.com/search?q=qdrant+hybrid%20search", "").1,
             "Google search for \"qdrant hybrid search\""
@@ -182,6 +221,9 @@ mod tests {
 
     #[test]
     fn generic_domains_become_readable() {
-        assert_eq!(describe("https://news.ycombinator.com/item?id=1", "").1, "Page on Ycombinator");
+        assert_eq!(
+            describe("https://news.ycombinator.com/item?id=1", "").1,
+            "Page on Ycombinator"
+        );
     }
 }

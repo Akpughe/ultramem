@@ -60,7 +60,12 @@ pub struct Action {
 
 impl Action {
     fn plain_new(fact: String) -> Self {
-        Action { fact, relation: Relation::New, supersedes: None, extends: None }
+        Action {
+            fact,
+            relation: Relation::New,
+            supersedes: None,
+            extends: None,
+        }
     }
 }
 
@@ -116,9 +121,24 @@ pub async fn reconcile(
                 let rel = rels.get(i).copied().unwrap_or(Relation::New);
                 actions.push(match rel {
                     Relation::New => Action::plain_new(fact),
-                    Relation::Duplicate => Action { fact, relation: Relation::Duplicate, supersedes: None, extends: None },
-                    Relation::Update => Action { fact, relation: Relation::Update, supersedes: Some(n.memory_id), extends: None },
-                    Relation::Extend => Action { fact, relation: Relation::Extend, supersedes: None, extends: Some(n.memory_id) },
+                    Relation::Duplicate => Action {
+                        fact,
+                        relation: Relation::Duplicate,
+                        supersedes: None,
+                        extends: None,
+                    },
+                    Relation::Update => Action {
+                        fact,
+                        relation: Relation::Update,
+                        supersedes: Some(n.memory_id),
+                        extends: None,
+                    },
+                    Relation::Extend => Action {
+                        fact,
+                        relation: Relation::Extend,
+                        supersedes: None,
+                        extends: Some(n.memory_id),
+                    },
                 });
             }
         }
@@ -165,7 +185,12 @@ fn parse_relations(raw: &str, n: usize) -> Option<Vec<Relation>> {
         if idx == 0 || idx > n {
             continue;
         }
-        out[idx - 1] = match obj["relation"].as_str().unwrap_or("NEW").to_ascii_uppercase().as_str() {
+        out[idx - 1] = match obj["relation"]
+            .as_str()
+            .unwrap_or("NEW")
+            .to_ascii_uppercase()
+            .as_str()
+        {
             "DUPLICATE" => Relation::Duplicate,
             "UPDATE" => Relation::Update,
             "EXTEND" => Relation::Extend,
@@ -180,7 +205,11 @@ mod tests {
     use super::*;
 
     fn neighbor(id: &str, fact: &str, score: f32) -> Neighbor {
-        Neighbor { memory_id: id.into(), fact: fact.into(), score }
+        Neighbor {
+            memory_id: id.into(),
+            fact: fact.into(),
+            score,
+        }
     }
 
     #[test]

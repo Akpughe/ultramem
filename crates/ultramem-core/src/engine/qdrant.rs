@@ -37,20 +37,32 @@ pub async fn ensure_collection(
     name: &str,
     dim: usize,
 ) -> Result<(), String> {
-    let exists = req(http, reqwest::Method::GET, base, key, &format!("/collections/{name}"))
-        .send()
-        .await
-        .map_err(|e| format!("qdrant unreachable: {e}"))?
-        .status()
-        .is_success();
+    let exists = req(
+        http,
+        reqwest::Method::GET,
+        base,
+        key,
+        &format!("/collections/{name}"),
+    )
+    .send()
+    .await
+    .map_err(|e| format!("qdrant unreachable: {e}"))?
+    .status()
+    .is_success();
     if exists {
         return Ok(());
     }
-    let resp = req(http, reqwest::Method::PUT, base, key, &format!("/collections/{name}"))
-        .json(&json!({ "vectors": { "size": dim, "distance": "Cosine" } }))
-        .send()
-        .await
-        .map_err(|e| format!("qdrant unreachable: {e}"))?;
+    let resp = req(
+        http,
+        reqwest::Method::PUT,
+        base,
+        key,
+        &format!("/collections/{name}"),
+    )
+    .json(&json!({ "vectors": { "size": dim, "distance": "Cosine" } }))
+    .send()
+    .await
+    .map_err(|e| format!("qdrant unreachable: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("qdrant create {name} failed: {}", resp.status()));
     }
@@ -68,26 +80,41 @@ pub async fn ensure_collection_hybrid(
     name: &str,
     dim: usize,
 ) -> Result<(), String> {
-    let exists = req(http, reqwest::Method::GET, base, key, &format!("/collections/{name}"))
-        .send()
-        .await
-        .map_err(|e| format!("qdrant unreachable: {e}"))?
-        .status()
-        .is_success();
+    let exists = req(
+        http,
+        reqwest::Method::GET,
+        base,
+        key,
+        &format!("/collections/{name}"),
+    )
+    .send()
+    .await
+    .map_err(|e| format!("qdrant unreachable: {e}"))?
+    .status()
+    .is_success();
     if exists {
         return Ok(());
     }
-    let resp = req(http, reqwest::Method::PUT, base, key, &format!("/collections/{name}"))
-        .json(&json!({
-            "vectors": { "dense": { "size": dim, "distance": "Cosine" } },
-            "sparse_vectors": { "text": { "modifier": "idf" } }
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("qdrant unreachable: {e}"))?;
+    let resp = req(
+        http,
+        reqwest::Method::PUT,
+        base,
+        key,
+        &format!("/collections/{name}"),
+    )
+    .json(&json!({
+        "vectors": { "dense": { "size": dim, "distance": "Cosine" } },
+        "sparse_vectors": { "text": { "modifier": "idf" } }
+    }))
+    .send()
+    .await
+    .map_err(|e| format!("qdrant unreachable: {e}"))?;
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("qdrant create hybrid {name} failed: {}", body.chars().take(200).collect::<String>()));
+        return Err(format!(
+            "qdrant create hybrid {name} failed: {}",
+            body.chars().take(200).collect::<String>()
+        ));
     }
     Ok(())
 }
@@ -128,20 +155,32 @@ pub async fn search_hybrid(
     if let Some(f) = filter {
         body["filter"] = f;
     }
-    let resp = req(http, reqwest::Method::POST, base, key, &format!("/collections/{collection}/points/query"))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("qdrant unreachable: {e}"))?;
+    let resp = req(
+        http,
+        reqwest::Method::POST,
+        base,
+        key,
+        &format!("/collections/{collection}/points/query"),
+    )
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| format!("qdrant unreachable: {e}"))?;
     let status = resp.status();
-    let v: Value = resp.json().await.map_err(|e| format!("qdrant bad response: {e}"))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("qdrant bad response: {e}"))?;
     if !status.is_success() {
         return Err(format!(
             "qdrant hybrid query {collection} failed {status}: {}",
             v["status"]["error"].as_str().unwrap_or("unknown")
         ));
     }
-    Ok(v["result"]["points"].as_array().cloned().unwrap_or_default())
+    Ok(v["result"]["points"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
 }
 
 /// Upsert points (`{id, vector, payload}` values). `wait=true` so a returned
@@ -189,14 +228,21 @@ pub async fn ensure_payload_index(
     field: &str,
     schema: &str,
 ) {
-    let _ = req(http, reqwest::Method::PUT, base, key, &format!("/collections/{collection}/index"))
-        .json(&json!({ "field_name": field, "field_schema": schema }))
-        .send()
-        .await;
+    let _ = req(
+        http,
+        reqwest::Method::PUT,
+        base,
+        key,
+        &format!("/collections/{collection}/index"),
+    )
+    .json(&json!({ "field_name": field, "field_schema": schema }))
+    .send()
+    .await;
 }
 
 /// Dense search. Returns the raw hit values: `{id, score, payload}`.
 /// `filter` is a Qdrant filter object (e.g. source/time constraints).
+#[allow(clippy::too_many_arguments)] // a transport call mirroring Qdrant's search params
 pub async fn search(
     http: &reqwest::Client,
     base: &str,
@@ -228,7 +274,10 @@ pub async fn search(
     .await
     .map_err(|e| format!("qdrant unreachable: {e}"))?;
     let status = resp.status();
-    let v: Value = resp.json().await.map_err(|e| format!("qdrant bad response: {e}"))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("qdrant bad response: {e}"))?;
     if !status.is_success() {
         return Err(format!(
             "qdrant search {collection} failed {status}: {}",
@@ -264,7 +313,10 @@ pub async fn set_payload(
     .await
     .map_err(|e| format!("qdrant unreachable: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("qdrant set_payload in {collection} failed: {}", resp.status()));
+        return Err(format!(
+            "qdrant set_payload in {collection} failed: {}",
+            resp.status()
+        ));
     }
     Ok(())
 }
@@ -323,14 +375,20 @@ pub async fn scroll(
     .await
     .map_err(|e| format!("qdrant unreachable: {e}"))?;
     let status = resp.status();
-    let v: Value = resp.json().await.map_err(|e| format!("qdrant bad response: {e}"))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("qdrant bad response: {e}"))?;
     if !status.is_success() {
         return Err(format!(
             "qdrant scroll {collection} failed {status}: {}",
             v["status"]["error"].as_str().unwrap_or("unknown")
         ));
     }
-    Ok(v["result"]["points"].as_array().cloned().unwrap_or_default())
+    Ok(v["result"]["points"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
 }
 
 /// Scroll ALL points matching an optional filter, paginating via Qdrant's
@@ -354,13 +412,25 @@ pub async fn scroll_all(
         if let Some(o) = &offset {
             body["offset"] = o.clone();
         }
-        let resp = req(http, reqwest::Method::POST, base, key, &format!("/collections/{collection}/points/scroll"))
-            .json(&body)
-            .send()
+        let resp = req(
+            http,
+            reqwest::Method::POST,
+            base,
+            key,
+            &format!("/collections/{collection}/points/scroll"),
+        )
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("qdrant unreachable: {e}"))?;
+        let v: Value = resp
+            .json()
             .await
-            .map_err(|e| format!("qdrant unreachable: {e}"))?;
-        let v: Value = resp.json().await.map_err(|e| format!("qdrant bad response: {e}"))?;
-        let pts = v["result"]["points"].as_array().cloned().unwrap_or_default();
+            .map_err(|e| format!("qdrant bad response: {e}"))?;
+        let pts = v["result"]["points"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         if pts.is_empty() {
             break;
         }
@@ -403,7 +473,10 @@ pub async fn chunks_of_doc(
     .send()
     .await
     .map_err(|e| format!("qdrant unreachable: {e}"))?;
-    let v: Value = resp.json().await.map_err(|e| format!("qdrant bad response: {e}"))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("qdrant bad response: {e}"))?;
     Ok(v["result"]["points"]
         .as_array()
         .map(|pts| {
@@ -441,14 +514,19 @@ pub async fn doc_chunks_indexed(
     .send()
     .await
     .map_err(|e| format!("qdrant unreachable: {e}"))?;
-    let v: Value = resp.json().await.map_err(|e| format!("qdrant bad response: {e}"))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("qdrant bad response: {e}"))?;
     Ok(v["result"]["points"]
         .as_array()
         .map(|pts| {
             pts.iter()
                 .filter_map(|p| {
                     let idx = p["payload"]["chunk_index"].as_i64().unwrap_or(0);
-                    p["payload"]["content"].as_str().map(|c| (idx, c.to_string()))
+                    p["payload"]["content"]
+                        .as_str()
+                        .map(|c| (idx, c.to_string()))
                 })
                 .collect()
         })
@@ -475,7 +553,10 @@ pub async fn delete_by_filter(
     .await
     .map_err(|e| format!("qdrant unreachable: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("qdrant filtered delete from {collection} failed: {}", resp.status()));
+        return Err(format!(
+            "qdrant filtered delete from {collection} failed: {}",
+            resp.status()
+        ));
     }
     Ok(())
 }
@@ -502,7 +583,10 @@ pub async fn delete_by_doc(
     .await
     .map_err(|e| format!("qdrant unreachable: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("qdrant delete from {collection} failed: {}", resp.status()));
+        return Err(format!(
+            "qdrant delete from {collection} failed: {}",
+            resp.status()
+        ));
     }
     Ok(())
 }
@@ -514,10 +598,16 @@ pub async fn delete_collection(
     key: &str,
     name: &str,
 ) -> Result<(), String> {
-    let resp = req(http, reqwest::Method::DELETE, base, key, &format!("/collections/{name}"))
-        .send()
-        .await
-        .map_err(|e| format!("qdrant unreachable: {e}"))?;
+    let resp = req(
+        http,
+        reqwest::Method::DELETE,
+        base,
+        key,
+        &format!("/collections/{name}"),
+    )
+    .send()
+    .await
+    .map_err(|e| format!("qdrant unreachable: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("qdrant drop {name} failed: {}", resp.status()));
     }

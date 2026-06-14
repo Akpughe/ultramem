@@ -143,7 +143,11 @@ impl EngineCfg {
             mistral_api_key: var("MISTRAL_API_KEY"),
             embedder: {
                 let e = var("ULTRAMEM_EMBEDDER");
-                if e.is_empty() { "jina".into() } else { e }
+                if e.is_empty() {
+                    "jina".into()
+                } else {
+                    e
+                }
             },
             openai_api_key: var("OPENAI_API_KEY"),
             plan_model: ResolvedModel::groq(groq_key.clone(), "llama-3.3-70b-versatile"),
@@ -153,11 +157,19 @@ impl EngineCfg {
             // throwaway collections without disturbing the default namespace.
             chunks_collection: {
                 let c = var("ULTRAMEM_CHUNKS_COLLECTION");
-                if c.is_empty() { "ultramem_chunks".into() } else { c }
+                if c.is_empty() {
+                    "ultramem_chunks".into()
+                } else {
+                    c
+                }
             },
             facts_collection: {
                 let c = var("ULTRAMEM_FACTS_COLLECTION");
-                if c.is_empty() { "ultramem_facts".into() } else { c }
+                if c.is_empty() {
+                    "ultramem_facts".into()
+                } else {
+                    c
+                }
             },
             ..Default::default()
         }
@@ -190,7 +202,11 @@ pub struct IngestDoc {
 impl IngestDoc {
     /// The effective namespace: the document's tag, or the default when blank.
     fn tag(&self) -> &str {
-        if self.container_tag.is_empty() { DEFAULT_TAG } else { &self.container_tag }
+        if self.container_tag.is_empty() {
+            DEFAULT_TAG
+        } else {
+            &self.container_tag
+        }
     }
 }
 
@@ -249,7 +265,10 @@ impl MemoryEngine {
             reranker: Arc::new(JinaReranker::new(cfg.jina_api_key.clone())),
             ocr: Arc::new(MistralOcr::new(cfg.mistral_api_key.clone())),
             llm: Arc::new(LlmClient::new()),
-            store: Arc::new(QdrantStore::new(cfg.qdrant_url.clone(), cfg.qdrant_api_key.clone())),
+            store: Arc::new(QdrantStore::new(
+                cfg.qdrant_url.clone(),
+                cfg.qdrant_api_key.clone(),
+            )),
             cfg: RwLock::new(cfg),
             profile_cache: RwLock::new(HashMap::new()),
         }
@@ -316,20 +335,36 @@ impl MemoryEngine {
         // Chunks go hybrid (dense+sparse) when enabled; facts stay dense (the
         // fact layer is short, semantic, and searched dense-only).
         if cfg.hybrid_search {
-            self.store.ensure_collection_hybrid(&cfg.chunks_collection, self.embedder.dim()).await?;
+            self.store
+                .ensure_collection_hybrid(&cfg.chunks_collection, self.embedder.dim())
+                .await?;
         } else {
-            self.store.ensure_collection(&cfg.chunks_collection, self.embedder.dim()).await?;
+            self.store
+                .ensure_collection(&cfg.chunks_collection, self.embedder.dim())
+                .await?;
         }
-        self.store.ensure_collection(&cfg.facts_collection, self.embedder.dim()).await?;
+        self.store
+            .ensure_collection(&cfg.facts_collection, self.embedder.dim())
+            .await?;
         for c in [&cfg.chunks_collection, &cfg.facts_collection] {
-            self.store.ensure_payload_index(c, "source", "keyword").await;
-            self.store.ensure_payload_index(c, "captured_at", "integer").await;
+            self.store
+                .ensure_payload_index(c, "source", "keyword")
+                .await;
+            self.store
+                .ensure_payload_index(c, "captured_at", "integer")
+                .await;
             // Namespace isolation filter (per-user / per-agent pools).
-            self.store.ensure_payload_index(c, "container_tag", "keyword").await;
+            self.store
+                .ensure_payload_index(c, "container_tag", "keyword")
+                .await;
         }
         // Memory lifecycle filtering (exclude superseded + expired facts).
-        self.store.ensure_payload_index(&cfg.facts_collection, "is_latest", "bool").await;
-        self.store.ensure_payload_index(&cfg.facts_collection, "valid_until", "integer").await;
+        self.store
+            .ensure_payload_index(&cfg.facts_collection, "is_latest", "bool")
+            .await;
+        self.store
+            .ensure_payload_index(&cfg.facts_collection, "valid_until", "integer")
+            .await;
         Ok(())
     }
 
@@ -349,7 +384,9 @@ impl MemoryEngine {
         const MIN_EXTRACT: usize = 24;
         let content = match &doc.file_path {
             Some(p) => {
-                let bytes = tokio::fs::read(p).await.map_err(|e| format!("read {p}: {e}"))?;
+                let bytes = tokio::fs::read(p)
+                    .await
+                    .map_err(|e| format!("read {p}: {e}"))?;
                 let filename = std::path::Path::new(p)
                     .file_name()
                     .map(|f| f.to_string_lossy().into_owned())
@@ -360,11 +397,15 @@ impl MemoryEngine {
                     // Reader nor textutil can read pixels.
                     self.ocr.ocr_image(&bytes, mime).await?
                 } else {
-                    match extract::jina(&self.http, &cfg.jina_api_key, bytes.clone(), &filename).await {
+                    match extract::jina(&self.http, &cfg.jina_api_key, bytes.clone(), &filename)
+                        .await
+                    {
                         Ok(t) if t.chars().count() >= MIN_EXTRACT => t,
                         jina => {
                             if let Err(e) = &jina {
-                                eprintln!("[recally] jina reader extract failed for '{filename}': {e}");
+                                eprintln!(
+                                    "[recally] jina reader extract failed for '{filename}': {e}"
+                                );
                             }
                             if lower.ends_with(".pdf") {
                                 self.ocr.ocr_pdf(&bytes).await?
@@ -400,7 +441,12 @@ impl MemoryEngine {
 
         // 2. Chunk — strategy follows content type (markdown by heading,
         // transcript by speaker turn, else paragraph).
-        let chunks = chunker::chunk_doc(&content, &doc.source, doc.file_path.as_deref(), cfg.smart_chunking);
+        let chunks = chunker::chunk_doc(
+            &content,
+            &doc.source,
+            doc.file_path.as_deref(),
+            cfg.smart_chunking,
+        );
         if chunks.is_empty() {
             return Err("empty content".into());
         }
@@ -416,7 +462,10 @@ impl MemoryEngine {
         } else {
             None
         };
-        let inputs: Vec<String> = chunks.iter().map(|c| embed_input(&doc.title, blurb.as_deref(), c)).collect();
+        let inputs: Vec<String> = chunks
+            .iter()
+            .map(|c| embed_input(&doc.title, blurb.as_deref(), c))
+            .collect();
         let vectors = self.embedder.embed(EmbedTask::Passage, &inputs).await?;
 
         // 4. Upsert chunks — after this the document is searchable. In hybrid
@@ -459,7 +508,9 @@ impl MemoryEngine {
         if !cfg.distill || content.chars().count() < 280 {
             return Ok(doc_id);
         }
-        match distill::distill_facts(self.llm.as_ref(), &cfg.distill_model, &doc.title, &content).await {
+        match distill::distill_facts(self.llm.as_ref(), &cfg.distill_model, &doc.title, &content)
+            .await
+        {
             Ok(facts) if !facts.is_empty() => {
                 if let Err(e) = self.index_memories(&cfg, doc, &doc_id, facts).await {
                     eprintln!("[recally] memory indexing failed for '{}': {e}", doc.title);
@@ -487,30 +538,47 @@ impl MemoryEngine {
         // Strip any "[until YYYY-MM-DD]" expiry suffix before embedding, so the
         // vector reflects the fact, not the bookkeeping. `facts` below is the
         // cleaned text; `expiry` maps clean text → valid_until.
-        let parsed: Vec<(String, Option<i64>)> = facts.iter().map(|f| memory::parse_expiry(f)).collect();
+        let parsed: Vec<(String, Option<i64>)> =
+            facts.iter().map(|f| memory::parse_expiry(f)).collect();
         let facts: Vec<String> = parsed.iter().map(|(f, _)| f.clone()).collect();
-        let expiry: std::collections::HashMap<&str, Option<i64>> =
-            facts.iter().map(|s| s.as_str()).zip(parsed.iter().map(|(_, e)| *e)).collect();
+        let expiry: std::collections::HashMap<&str, Option<i64>> = facts
+            .iter()
+            .map(|s| s.as_str())
+            .zip(parsed.iter().map(|(_, e)| *e))
+            .collect();
         let fvecs = self.embedder.embed(EmbedTask::Passage, &facts).await?;
 
         // Reconcile against the existing memory graph (skip when disabled — then
         // every fact is simply NEW).
         let actions = if cfg.memory_graph {
             // For each new fact, find its single nearest *latest* memory.
-            let mut with_neighbors: Vec<(String, Option<memory::Neighbor>)> = Vec::with_capacity(facts.len());
+            let mut with_neighbors: Vec<(String, Option<memory::Neighbor>)> =
+                Vec::with_capacity(facts.len());
             for (fact, vec) in facts.iter().zip(fvecs.iter()) {
                 // Reconcile only within the same namespace — a fact in tenant A
                 // must never supersede or extend a memory in tenant B.
-                let neighbor_filter = tagged_filter(Some(active_facts_filter(None, chrono::Utc::now().timestamp())), doc.tag());
-                let hits = self.store.search(&cfg.facts_collection,
-                    vec, 1, memory::RELATE_THRESHOLD, Some(neighbor_filter),
-                )
-                .await
-                .unwrap_or_default();
+                let neighbor_filter = tagged_filter(
+                    Some(active_facts_filter(None, chrono::Utc::now().timestamp())),
+                    doc.tag(),
+                );
+                let hits = self
+                    .store
+                    .search(
+                        &cfg.facts_collection,
+                        vec,
+                        1,
+                        memory::RELATE_THRESHOLD,
+                        Some(neighbor_filter),
+                    )
+                    .await
+                    .unwrap_or_default();
                 let neighbor = hits.first().and_then(|h| {
                     Some(memory::Neighbor {
                         memory_id: h["id"].as_str()?.to_string(),
-                        fact: h["payload"]["fact"].as_str().unwrap_or_default().to_string(),
+                        fact: h["payload"]["fact"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
                         score: h["score"].as_f64().unwrap_or(0.0) as f32,
                     })
                 });
@@ -518,12 +586,15 @@ impl MemoryEngine {
             }
             memory::reconcile(self.llm.as_ref(), &cfg.distill_model, with_neighbors).await
         } else {
-            facts.iter().map(|f| memory::Action {
-                fact: f.clone(),
-                relation: memory::Relation::New,
-                supersedes: None,
-                extends: None,
-            }).collect()
+            facts
+                .iter()
+                .map(|f| memory::Action {
+                    fact: f.clone(),
+                    relation: memory::Relation::New,
+                    supersedes: None,
+                    extends: None,
+                })
+                .collect()
         };
 
         // Build points for everything that survives (drop DUPLICATEs), and
@@ -539,7 +610,9 @@ impl MemoryEngine {
             if let Some(old) = &action.supersedes {
                 superseded.push(old.clone());
             }
-            let Some(vec) = fact_vec.get(action.fact.as_str()) else { continue };
+            let Some(vec) = fact_vec.get(action.fact.as_str()) else {
+                continue;
+            };
             points.push(json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "vector": vec,
@@ -563,12 +636,19 @@ impl MemoryEngine {
 
         // Flag superseded memories as no longer latest (history preserved).
         if !superseded.is_empty() {
-            if let Err(e) = self.store.set_payload(&cfg.facts_collection,
-                &superseded, json!({ "is_latest": false }),
-            )
-            .await
+            if let Err(e) = self
+                .store
+                .set_payload(
+                    &cfg.facts_collection,
+                    &superseded,
+                    json!({ "is_latest": false }),
+                )
+                .await
             {
-                eprintln!("[recally] failed to flag {} superseded memories: {e}", superseded.len());
+                eprintln!(
+                    "[recally] failed to flag {} superseded memories: {e}",
+                    superseded.len()
+                );
             }
         }
         Ok(())
@@ -579,7 +659,11 @@ impl MemoryEngine {
     /// questions; the plan becomes a Qdrant payload filter. Then the planned
     /// query is embedded once and chunks + facts are searched in parallel.
     /// If a filtered search finds nothing, it retries unfiltered.
-    pub async fn retrieve(&self, q: &str, limit: usize) -> Result<(Vec<SearchResult>, Vec<String>), String> {
+    pub async fn retrieve(
+        &self,
+        q: &str,
+        limit: usize,
+    ) -> Result<(Vec<SearchResult>, Vec<String>), String> {
         self.retrieve_with_context(q, None, limit).await
     }
 
@@ -593,7 +677,8 @@ impl MemoryEngine {
         limit: usize,
     ) -> Result<(Vec<SearchResult>, Vec<String>), String> {
         let plan = self.plan_query(q, context).await;
-        self.retrieve_for_plan_tagged(tag, q, &plan, context, limit).await
+        self.retrieve_for_plan_tagged(tag, q, &plan, context, limit)
+            .await
     }
 
     /// Expose the search plan so callers can route enumeration ("list all
@@ -607,8 +692,15 @@ impl MemoryEngine {
     /// Retrieval WITHOUT the LLM planning pass — the query is searched as-is.
     /// Used by the A/B benchmark so it measures the embedding/retrieval change
     /// in isolation (no planner cost, no planner non-determinism) and runs fast.
-    pub async fn retrieve_raw(&self, q: &str, limit: usize) -> Result<(Vec<SearchResult>, Vec<String>), String> {
-        let plan = rewrite::SearchPlan { query: q.to_string(), ..Default::default() };
+    pub async fn retrieve_raw(
+        &self,
+        q: &str,
+        limit: usize,
+    ) -> Result<(Vec<SearchResult>, Vec<String>), String> {
+        let plan = rewrite::SearchPlan {
+            query: q.to_string(),
+            ..Default::default()
+        };
         self.retrieve_for_plan(q, &plan, None, limit).await
     }
 
@@ -639,9 +731,13 @@ impl MemoryEngine {
     ) -> Result<Vec<Value>, String> {
         if cfg.hybrid_search {
             let sv = sparse::sparse_vector(embed_text);
-            self.store.search_hybrid(&cfg.chunks_collection, qv, &sv, limit, filter).await
+            self.store
+                .search_hybrid(&cfg.chunks_collection, qv, &sv, limit, filter)
+                .await
         } else {
-            self.store.search(&cfg.chunks_collection, qv, limit, threshold, filter).await
+            self.store
+                .search(&cfg.chunks_collection, qv, limit, threshold, filter)
+                .await
         }
     }
 
@@ -653,7 +749,8 @@ impl MemoryEngine {
         context: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<SearchResult>, Vec<String>), String> {
-        self.retrieve_for_plan_tagged(DEFAULT_TAG, q, plan, context, limit).await
+        self.retrieve_for_plan_tagged(DEFAULT_TAG, q, plan, context, limit)
+            .await
     }
 
     /// Semantic retrieval for an already-computed plan, scoped to one namespace.
@@ -690,7 +787,10 @@ impl MemoryEngine {
                 // Blend ALL prior user questions, not just the last — by the
                 // 3rd turn the immediately-previous one ("what is it about?")
                 // is itself generic; the topical keywords live in turn 1.
-                let prior: Vec<&str> = ctx.lines().filter_map(|l| l.strip_prefix("user: ")).collect();
+                let prior: Vec<&str> = ctx
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("user: "))
+                    .collect();
                 if !prior.is_empty() {
                     embed_text = format!("{}\n{embed_text}", prior.join("\n"));
                 }
@@ -703,26 +803,48 @@ impl MemoryEngine {
         // both chunk searches run concurrently with the facts search, so the
         // recall boost costs ~no extra latency. The reranker stays the gate.
         let want_mq = cfg.multi_query && plan.query.trim() != q.trim();
-        let embed_inputs: Vec<String> =
-            if want_mq { vec![embed_text.clone(), q.to_string()] } else { vec![embed_text.clone()] };
+        let embed_inputs: Vec<String> = if want_mq {
+            vec![embed_text.clone(), q.to_string()]
+        } else {
+            vec![embed_text.clone()]
+        };
         let qvs = self.embedder.embed(EmbedTask::Query, &embed_inputs).await?;
         let qv = qvs.first().cloned().ok_or("no query embedding")?;
-        let facts_filter = Some(active_facts_filter(filter.clone(), chrono::Utc::now().timestamp()));
+        let facts_filter = Some(active_facts_filter(
+            filter.clone(),
+            chrono::Utc::now().timestamp(),
+        ));
 
         // Facts exclude superseded/expired memories so a contradicted fact
         // ("uses Adidas" after "switched to Puma") never surfaces.
         let (chunk_hits, chunk_hits2, fact_hits) = if want_mq {
             let qv2 = qvs.get(1).cloned().unwrap_or_else(|| qv.clone());
             let (a, b, f) = tokio::join!(
-                self.search_chunks(&cfg, &qv, &embed_text, hit_limit, CHUNK_THRESHOLD, filter.clone()),
+                self.search_chunks(
+                    &cfg,
+                    &qv,
+                    &embed_text,
+                    hit_limit,
+                    CHUNK_THRESHOLD,
+                    filter.clone()
+                ),
                 self.search_chunks(&cfg, &qv2, q, hit_limit, CHUNK_THRESHOLD, filter.clone()),
-                self.store.search(&cfg.facts_collection, &qv, 10, FACT_THRESHOLD, facts_filter),
+                self.store
+                    .search(&cfg.facts_collection, &qv, 10, FACT_THRESHOLD, facts_filter),
             );
             (a, Some(b), f)
         } else {
             let (a, f) = tokio::join!(
-                self.search_chunks(&cfg, &qv, &embed_text, hit_limit, CHUNK_THRESHOLD, filter.clone()),
-                self.store.search(&cfg.facts_collection, &qv, 10, FACT_THRESHOLD, facts_filter),
+                self.search_chunks(
+                    &cfg,
+                    &qv,
+                    &embed_text,
+                    hit_limit,
+                    CHUNK_THRESHOLD,
+                    filter.clone()
+                ),
+                self.store
+                    .search(&cfg.facts_collection, &qv, 10, FACT_THRESHOLD, facts_filter),
             );
             (a, None, f)
         };
@@ -730,10 +852,16 @@ impl MemoryEngine {
 
         // Union the second query's hits (dedup by point id).
         if let Some(Ok(extra)) = chunk_hits2 {
-            let seen: std::collections::HashSet<String> =
-                chunk_hits.iter().filter_map(|h| h["id"].as_str().map(String::from)).collect();
+            let seen: std::collections::HashSet<String> = chunk_hits
+                .iter()
+                .filter_map(|h| h["id"].as_str().map(String::from))
+                .collect();
             for h in extra {
-                if !h["id"].as_str().map(|id| seen.contains(id)).unwrap_or(false) {
+                if !h["id"]
+                    .as_str()
+                    .map(|id| seen.contains(id))
+                    .unwrap_or(false)
+                {
                     chunk_hits.push(h);
                 }
             }
@@ -745,7 +873,14 @@ impl MemoryEngine {
         // the tag, never search the whole cross-tenant pool.
         if chunk_hits.is_empty() && had_plan_constraints {
             chunk_hits = self
-                .search_chunks(&cfg, &qv, &embed_text, hit_limit, FALLBACK_THRESHOLD, Some(tagged_filter(None, tag)))
+                .search_chunks(
+                    &cfg,
+                    &qv,
+                    &embed_text,
+                    hit_limit,
+                    FALLBACK_THRESHOLD,
+                    Some(tagged_filter(None, tag)),
+                )
                 .await?;
         }
 
@@ -759,7 +894,12 @@ impl MemoryEngine {
                 .iter()
                 .map(|r| {
                     let title = r.title.clone().unwrap_or_default();
-                    let body: String = r.chunks.iter().map(|c| c.content.as_str()).collect::<Vec<_>>().join("\n");
+                    let body: String = r
+                        .chunks
+                        .iter()
+                        .map(|c| c.content.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     format!("{title}\n{}", body.chars().take(1500).collect::<String>())
                 })
                 .collect();
@@ -782,9 +922,12 @@ impl MemoryEngine {
                             (i, s + title_match * TITLE_BOOST)
                         })
                         .collect();
-                    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    let keep: Vec<SearchResult> =
-                        ranked.into_iter().filter_map(|(i, _)| results.get(i).cloned()).collect();
+                    ranked
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let keep: Vec<SearchResult> = ranked
+                        .into_iter()
+                        .filter_map(|(i, _)| results.get(i).cloned())
+                        .collect();
                     if !keep.is_empty() {
                         results = keep;
                     }
@@ -819,8 +962,13 @@ impl MemoryEngine {
             }
         }
         let cfg = self.cfg();
-        let p = profile::compile(self.store.as_ref(), self.llm.as_ref(), &cfg, tag).await.unwrap_or_default();
-        self.profile_cache.write().unwrap().insert(tag.to_string(), (p.clone(), now));
+        let p = profile::compile(self.store.as_ref(), self.llm.as_ref(), &cfg, tag)
+            .await
+            .unwrap_or_default();
+        self.profile_cache
+            .write()
+            .unwrap()
+            .insert(tag.to_string(), (p.clone(), now));
         p
     }
 
@@ -836,8 +984,7 @@ impl MemoryEngine {
     /// fact's payload, so one scroll over the facts collection is enough.
     pub async fn graph(&self, limit: usize) -> Result<Value, String> {
         let cfg = self.cfg();
-        let points =
-            self.store.scroll(&cfg.facts_collection, limit).await?;
+        let points = self.store.scroll(&cfg.facts_collection, limit).await?;
 
         let mut nodes: Vec<Value> = Vec::new();
         let mut edges: Vec<Value> = Vec::new();
@@ -848,7 +995,10 @@ impl MemoryEngine {
             let (Some(fact), Some(doc_id)) = (pl["fact"].as_str(), pl["doc_id"].as_str()) else {
                 continue;
             };
-            let fact_id = p["id"].as_str().map(String::from).unwrap_or_else(|| p["id"].to_string());
+            let fact_id = p["id"]
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| p["id"].to_string());
             nodes.push(json!({
                 "id": fact_id,
                 "label": fact,
@@ -878,10 +1028,9 @@ impl MemoryEngine {
         let cfg = self.cfg();
         let filter = json!({ "must": [ { "is_empty": { "key": "container_tag" } } ] });
         for c in [&cfg.chunks_collection, &cfg.facts_collection] {
-            self.store.set_payload_by_filter(c,
-                filter.clone(), json!({ "container_tag": tag }),
-            )
-            .await?;
+            self.store
+                .set_payload_by_filter(c, filter.clone(), json!({ "container_tag": tag }))
+                .await?;
         }
         Ok(())
     }
@@ -891,10 +1040,9 @@ impl MemoryEngine {
     pub async fn backfill_facts_latest(&self) -> Result<(), String> {
         let cfg = self.cfg();
         let filter = json!({ "must": [ { "is_empty": { "key": "is_latest" } } ] });
-        self.store.set_payload_by_filter(&cfg.facts_collection,
-            filter, json!({ "is_latest": true }),
-        )
-        .await
+        self.store
+            .set_payload_by_filter(&cfg.facts_collection, filter, json!({ "is_latest": true }))
+            .await
     }
 
     /// Reconstruct a document's text from its INDEXED chunks (in order), without
@@ -902,11 +1050,16 @@ impl MemoryEngine {
     /// payloads, so this is how re-indexing avoids re-running OCR/extraction.
     pub async fn reconstruct_doc_text(&self, doc_id: &str) -> Result<String, String> {
         let cfg = self.cfg();
-        let mut chunks = self.store.doc_chunks_indexed(&cfg.chunks_collection, doc_id, 500,
-        )
-        .await?;
+        let mut chunks = self
+            .store
+            .doc_chunks_indexed(&cfg.chunks_collection, doc_id, 500)
+            .await?;
         chunks.sort_by_key(|(i, _)| *i);
-        Ok(chunks.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>().join("\n\n"))
+        Ok(chunks
+            .iter()
+            .map(|(_, c)| c.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n"))
     }
 
     /// One row per distinct document in a namespace: `(doc_id, title, source,
@@ -923,14 +1076,17 @@ impl MemoryEngine {
         let cfg = self.cfg();
         let filter = tagged_filter(None, tag);
         // Cap the scroll generously; dedup collapses it to distinct documents.
-        let points = self.store.scroll_all(&cfg.chunks_collection, Some(filter), 50_000,
-        )
-        .await?;
+        let points = self
+            .store
+            .scroll_all(&cfg.chunks_collection, Some(filter), 50_000)
+            .await?;
         let mut seen: std::collections::HashSet<String> = Default::default();
         let mut rows: Vec<(String, String, String, String, i64)> = Vec::new();
         for p in &points {
             let pl = &p["payload"];
-            let Some(doc_id) = pl["doc_id"].as_str() else { continue };
+            let Some(doc_id) = pl["doc_id"].as_str() else {
+                continue;
+            };
             if !seen.insert(doc_id.to_string()) {
                 continue;
             }
@@ -946,7 +1102,7 @@ impl MemoryEngine {
                 captured_at,
             ));
         }
-        rows.sort_by(|a, b| b.4.cmp(&a.4)); // newest first
+        rows.sort_by_key(|r| std::cmp::Reverse(r.4)); // newest first
         rows.truncate(limit);
         Ok(rows)
     }
@@ -990,8 +1146,16 @@ impl MemoryEngine {
             return Err("no distill model configured".into());
         }
         // Fresh facts replace stale ones for this document.
-        self.store.delete_by_doc(&cfg.facts_collection, doc_id).await?;
-        let facts = distill::distill_facts(self.llm.as_ref(), &cfg.distill_model, &doc.title, &doc.content).await?;
+        self.store
+            .delete_by_doc(&cfg.facts_collection, doc_id)
+            .await?;
+        let facts = distill::distill_facts(
+            self.llm.as_ref(),
+            &cfg.distill_model,
+            &doc.title,
+            &doc.content,
+        )
+        .await?;
         let n = facts.len();
         if !facts.is_empty() {
             self.index_memories(&cfg, doc, doc_id, facts).await?;
@@ -1110,7 +1274,11 @@ fn embed_input(title: &str, context: Option<&str>, chunk: &str) -> String {
         .collect();
     let mut prefix = readable.split_whitespace().collect::<Vec<_>>().join(" ");
     if let Some(ctx) = context.map(str::trim).filter(|c| !c.is_empty()) {
-        prefix = if prefix.is_empty() { ctx.to_string() } else { format!("{prefix}\n{ctx}") };
+        prefix = if prefix.is_empty() {
+            ctx.to_string()
+        } else {
+            format!("{prefix}\n{ctx}")
+        };
     }
     if prefix.is_empty() {
         chunk.to_string()
@@ -1172,6 +1340,7 @@ mod tests {
     /// `cfg.embedder` swaps the provider (and its dimensionality) with no engine
     /// edits — and a fully custom `dyn Embedder` can be injected on top.
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // incremental cfg mutation reads clearer here
     fn embedder_is_config_selectable() {
         let mut cfg = EngineCfg::default();
         cfg.embedder = "jina".into();
@@ -1196,8 +1365,12 @@ mod tests {
             async fn embed(&self, _t: EmbedTask, ins: &[String]) -> Result<Vec<Vec<f32>>, String> {
                 Ok(ins.iter().map(|_| vec![0.0; 8]).collect())
             }
-            fn dim(&self) -> usize { 8 }
-            fn id(&self) -> &str { "tiny-test" }
+            fn dim(&self) -> usize {
+                8
+            }
+            fn id(&self) -> &str {
+                "tiny-test"
+            }
         }
         let custom = MemoryEngine::new(EngineCfg::default()).with_embedder(Arc::new(Tiny));
         assert_eq!(custom.embedder_dim(), 8);
@@ -1343,8 +1516,14 @@ mod pipeline_tests {
             assert!(!cfg.qdrant_url.is_empty(), "QDRANT_URL missing");
             let engine = MemoryEngine::new(cfg.clone());
 
-            assert!(engine.health().await, "engine unhealthy — check QDRANT_URL/keys");
-            engine.ensure_collections().await.expect("ensure_collections");
+            assert!(
+                engine.health().await,
+                "engine unhealthy — check QDRANT_URL/keys"
+            );
+            engine
+                .ensure_collections()
+                .await
+                .expect("ensure_collections");
 
             let marker = uuid::Uuid::new_v4().to_string();
             let doc = IngestDoc {
@@ -1373,7 +1552,10 @@ mod pipeline_tests {
             let found = results.iter().find(|r| r.document_id == doc_id).unwrap();
             assert!(found.chunks.iter().any(|c| c.content.contains(&marker)));
 
-            engine.delete_document(&doc_id).await.expect("delete_document");
+            engine
+                .delete_document(&doc_id)
+                .await
+                .expect("delete_document");
             let (after, _) = engine
                 .retrieve(&format!("what is the magic marker? {marker}"), 8)
                 .await
@@ -1385,8 +1567,20 @@ mod pipeline_tests {
 
             // Clean up test collections.
             let http = reqwest::Client::new();
-            let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.chunks_collection).await;
-            let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.facts_collection).await;
+            let _ = qdrant::delete_collection(
+                &http,
+                &cfg.qdrant_url,
+                &cfg.qdrant_api_key,
+                &cfg.chunks_collection,
+            )
+            .await;
+            let _ = qdrant::delete_collection(
+                &http,
+                &cfg.qdrant_url,
+                &cfg.qdrant_api_key,
+                &cfg.facts_collection,
+            )
+            .await;
         });
     }
 

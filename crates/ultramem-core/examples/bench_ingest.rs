@@ -21,7 +21,14 @@ const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_CONTENT_CHARS: usize = 20_000;
 const EXTENSIONS: [&str; 8] = ["md", "txt", "rtf", "csv", "pdf", "docx", "doc", "pages"];
 const SKIP_DIRS: [&str; 8] = [
-    "node_modules", ".git", "target", "dist", "build", ".next", ".supermemory", "Library",
+    "node_modules",
+    ".git",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".supermemory",
+    "Library",
 ];
 
 fn should_skip(path: &Path) -> bool {
@@ -115,13 +122,31 @@ async fn main() {
     let qdrant_key = cfg.qdrant_api_key.clone();
 
     let engine = Arc::new(MemoryEngine::new(cfg));
-    assert!(engine.health().await, "engine unhealthy — check QDRANT_URL / keys");
-    engine.ensure_collections().await.expect("ensure_collections");
+    assert!(
+        engine.health().await,
+        "engine unhealthy — check QDRANT_URL / keys"
+    );
+    engine
+        .ensure_collections()
+        .await
+        .expect("ensure_collections");
 
     println!("Scanning {dirs:?} for up to {max_files} files…");
     let files = collect_files(&dirs, max_files);
-    let pdf_count = files.iter().filter(|f| wanted(f) && f.extension().map(|e| e.to_string_lossy().to_lowercase() == "pdf").unwrap_or(false)).count();
-    println!("Found {} files ({} PDFs → Mistral OCR). Ingesting at concurrency {CONCURRENCY}…\n", files.len(), pdf_count);
+    let pdf_count = files
+        .iter()
+        .filter(|f| {
+            wanted(f)
+                && f.extension()
+                    .map(|e| e.to_string_lossy().to_lowercase() == "pdf")
+                    .unwrap_or(false)
+        })
+        .count();
+    println!(
+        "Found {} files ({} PDFs → Mistral OCR). Ingesting at concurrency {CONCURRENCY}…\n",
+        files.len(),
+        pdf_count
+    );
 
     let total_start = std::time::Instant::now();
     let sem = Arc::new(tokio::sync::Semaphore::new(CONCURRENCY));
@@ -132,10 +157,19 @@ async fn main() {
         let sem = sem.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let is_pdf = path.extension().map(|e| e.to_string_lossy().to_lowercase() == "pdf").unwrap_or(false);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let is_pdf = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase() == "pdf")
+                .unwrap_or(false);
             let (content, file_path) = if is_pdf {
-                (format!("PDF file \"{name}\""), Some(path.to_string_lossy().into_owned()))
+                (
+                    format!("PDF file \"{name}\""),
+                    Some(path.to_string_lossy().into_owned()),
+                )
             } else {
                 let Some(text) = extract_text(&path) else {
                     return None; // unextractable — skip it
@@ -205,11 +239,18 @@ async fn main() {
         println!("median per doc:   {}ms", percentile(&ok_ms, 0.5));
         println!("p95 per doc:      {}ms", percentile(&ok_ms, 0.95));
         println!("min / max:        {}ms / {}ms", ok_ms[0], ok_ms[n - 1]);
-        println!("throughput:       {:.1} docs/min", n as f64 / total.as_secs_f64() * 60.0);
+        println!(
+            "throughput:       {:.1} docs/min",
+            n as f64 / total.as_secs_f64() * 60.0
+        );
     }
     if !pdf_ms.is_empty() {
         let psum: u128 = pdf_ms.iter().sum();
-        println!("pdf (OCR) avg:    {}ms over {} PDFs", psum / pdf_ms.len() as u128, pdf_ms.len());
+        println!(
+            "pdf (OCR) avg:    {}ms over {} PDFs",
+            psum / pdf_ms.len() as u128,
+            pdf_ms.len()
+        );
     }
     println!("===========================================");
 

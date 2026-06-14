@@ -10,20 +10,15 @@ use serde_json::{json, Value};
 
 pub const GROQ_BASE: &str = "https://api.groq.com/openai/v1";
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ProviderKind {
     /// OpenAI Chat Completions wire format (the de-facto standard).
+    #[default]
     #[serde(alias = "openai", alias = "openai_compat", alias = "openaicompat")]
     OpenaiCompat,
     /// Anthropic Messages API.
     Anthropic,
-}
-
-impl Default for ProviderKind {
-    fn default() -> Self {
-        ProviderKind::OpenaiCompat
-    }
 }
 
 /// A fully-resolved model call target.
@@ -201,11 +196,17 @@ impl LlmClient {
     ) -> Result<(Value, ChatStep), String> {
         if m.kind != ProviderKind::OpenaiCompat {
             let text = self.complete(m, messages, temperature).await?;
-            return Ok((json!({"role": "assistant", "content": text.clone()}), ChatStep::Message(text)));
+            return Ok((
+                json!({"role": "assistant", "content": text.clone()}),
+                ChatStep::Message(text),
+            ));
         }
         let resp = self
             .http
-            .post(format!("{}/chat/completions", m.base_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/chat/completions",
+                m.base_url.trim_end_matches('/')
+            ))
             .bearer_auth(&m.api_key)
             .json(&json!({
                 "model": m.model,
@@ -235,8 +236,14 @@ impl LlmClient {
                 .iter()
                 .map(|tc| ToolCall {
                     id: tc["id"].as_str().unwrap_or_default().to_string(),
-                    name: tc["function"]["name"].as_str().unwrap_or_default().to_string(),
-                    arguments: tc["function"]["arguments"].as_str().unwrap_or("{}").to_string(),
+                    name: tc["function"]["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    arguments: tc["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or("{}")
+                        .to_string(),
                 })
                 .collect();
             Ok((msg, ChatStep::ToolCalls(calls)))
@@ -254,8 +261,13 @@ impl LlmClient {
         on_token: impl Fn(&str),
     ) -> Result<String, String> {
         match m.kind {
-            ProviderKind::OpenaiCompat => self.stream_openai(m, messages, temperature, on_token).await,
-            ProviderKind::Anthropic => self.stream_anthropic(m, messages, temperature, on_token).await,
+            ProviderKind::OpenaiCompat => {
+                self.stream_openai(m, messages, temperature, on_token).await
+            }
+            ProviderKind::Anthropic => {
+                self.stream_anthropic(m, messages, temperature, on_token)
+                    .await
+            }
         }
     }
 
@@ -268,7 +280,10 @@ impl LlmClient {
     ) -> Result<String, String> {
         let resp = self
             .http
-            .post(format!("{}/chat/completions", m.base_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/chat/completions",
+                m.base_url.trim_end_matches('/')
+            ))
             .bearer_auth(&m.api_key)
             .json(&json!({
                 "model": m.model,
@@ -374,7 +389,9 @@ impl LlmClient {
         mime: &str,
     ) -> Result<String, String> {
         if m.kind != ProviderKind::OpenaiCompat {
-            return Err("transcription needs an OpenAI-compatible provider (Groq or OpenAI)".into());
+            return Err(
+                "transcription needs an OpenAI-compatible provider (Groq or OpenAI)".into(),
+            );
         }
         let part = reqwest::multipart::Part::bytes(bytes)
             .file_name(filename.to_string())
@@ -386,7 +403,10 @@ impl LlmClient {
             .text("response_format", "json");
         let resp = self
             .http
-            .post(format!("{}/audio/transcriptions", m.base_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/audio/transcriptions",
+                m.base_url.trim_end_matches('/')
+            ))
             .bearer_auth(&m.api_key)
             .multipart(form)
             .send()
@@ -410,7 +430,9 @@ impl LlmClient {
         audio_path: &std::path::Path,
     ) -> Result<Vec<TranscriptSegment>, String> {
         if m.kind != ProviderKind::OpenaiCompat {
-            return Err("transcription needs an OpenAI-compatible provider (Groq or OpenAI)".into());
+            return Err(
+                "transcription needs an OpenAI-compatible provider (Groq or OpenAI)".into(),
+            );
         }
         let bytes = tokio::fs::read(audio_path)
             .await
@@ -429,7 +451,10 @@ impl LlmClient {
             .text("response_format", "verbose_json");
         let resp = self
             .http
-            .post(format!("{}/audio/transcriptions", m.base_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/audio/transcriptions",
+                m.base_url.trim_end_matches('/')
+            ))
             .bearer_auth(&m.api_key)
             .multipart(form)
             .send()

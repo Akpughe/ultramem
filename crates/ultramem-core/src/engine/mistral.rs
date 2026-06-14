@@ -8,21 +8,45 @@ pub const MODEL: &str = "mistral-ocr-latest";
 const URL: &str = "https://api.mistral.ai/v1/ocr";
 
 /// OCR a PDF. Returns all pages' markdown concatenated.
-pub async fn ocr_pdf(http: &reqwest::Client, api_key: &str, pdf_bytes: &[u8]) -> Result<String, String> {
+pub async fn ocr_pdf(
+    http: &reqwest::Client,
+    api_key: &str,
+    pdf_bytes: &[u8],
+) -> Result<String, String> {
     let data_url = format!("data:application/pdf;base64,{}", B64.encode(pdf_bytes));
-    ocr(http, api_key, json!({ "type": "document_url", "document_url": data_url })).await
+    ocr(
+        http,
+        api_key,
+        json!({ "type": "document_url", "document_url": data_url }),
+    )
+    .await
 }
 
 /// OCR an image (screenshot, photo of a doc, etc.). `mime` is the image's MIME
 /// type, e.g. "image/png". Returns the recognized text as markdown.
-pub async fn ocr_image(http: &reqwest::Client, api_key: &str, image_bytes: &[u8], mime: &str) -> Result<String, String> {
+pub async fn ocr_image(
+    http: &reqwest::Client,
+    api_key: &str,
+    image_bytes: &[u8],
+    mime: &str,
+) -> Result<String, String> {
     let data_url = format!("data:{mime};base64,{}", B64.encode(image_bytes));
-    ocr(http, api_key, json!({ "type": "image_url", "image_url": data_url })).await
+    ocr(
+        http,
+        api_key,
+        json!({ "type": "image_url", "image_url": data_url }),
+    )
+    .await
 }
 
 /// MIME type for a supported image extension, or None if not an image we OCR.
 pub fn image_mime(path: &str) -> Option<&'static str> {
-    match path.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref() {
+    match path
+        .rsplit('.')
+        .next()
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("png") => Some("image/png"),
         Some("jpg") | Some("jpeg") => Some("image/jpeg"),
         Some("gif") => Some("image/gif"),
@@ -50,7 +74,10 @@ async fn ocr(http: &reqwest::Client, api_key: &str, document: Value) -> Result<S
         .await
         .map_err(|e| format!("mistral unreachable: {e}"))?;
     let status = resp.status();
-    let v: Value = resp.json().await.map_err(|e| format!("mistral bad response: {e}"))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("mistral bad response: {e}"))?;
     if !status.is_success() {
         let detail = v["message"]
             .as_str()

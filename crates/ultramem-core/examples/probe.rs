@@ -33,7 +33,10 @@ async fn main() {
     let cfg = EngineCfg::from_env();
     assert!(!cfg.qdrant_url.is_empty(), "QDRANT_URL not set");
     let engine = Arc::new(MemoryEngine::new(cfg.clone()));
-    assert!(engine.health().await, "engine unhealthy — check QDRANT_URL / JINA_API_KEY");
+    assert!(
+        engine.health().await,
+        "engine unhealthy — check QDRANT_URL / JINA_API_KEY"
+    );
     engine.ensure_collections().await.expect("collections");
 
     match arg.as_str() {
@@ -53,14 +56,18 @@ async fn main() {
         "seed" => {
             // probe seed <file.json>  -> ingest a committed [{title,content}] corpus
             // into the configured collections (DEFAULT_TAG). Reproducible bench setup.
-            let path = std::env::args().nth(2).unwrap_or_else(|| "eval/corpus_demo.json".into());
+            let path = std::env::args()
+                .nth(2)
+                .unwrap_or_else(|| "eval/corpus_demo.json".into());
             run_seed(&engine, &path).await;
         }
         "drop" => {
             // probe drop  -> delete the configured chunks+facts collections (cleanup).
             let http = reqwest::Client::new();
             for c in [&cfg.chunks_collection, &cfg.facts_collection] {
-                match qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, c).await {
+                match qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, c)
+                    .await
+                {
                     Ok(()) => println!("dropped {c}"),
                     Err(e) => eprintln!("drop {c} failed: {e}"),
                 }
@@ -68,7 +75,9 @@ async fn main() {
         }
         "reindex" => run_reindex(&engine, &cfg).await,
         "profile" => {
-            let tag = std::env::args().nth(2).unwrap_or_else(|| DEFAULT_TAG.to_string());
+            let tag = std::env::args()
+                .nth(2)
+                .unwrap_or_else(|| DEFAULT_TAG.to_string());
             let p = engine.profile_tagged(&tag).await;
             println!("================ STANDING PROFILE ({tag}) ================\n");
             if p.is_empty() {
@@ -172,8 +181,20 @@ async fn run_memtest(cfg: &EngineCfg) {
         let tag = sc.name.replace(' ', "_").replace(['(', ')'], "");
         cfg.chunks_collection = format!("ultramem_mem_{tag}_c");
         cfg.facts_collection = format!("ultramem_mem_{tag}_f");
-        let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.chunks_collection).await;
-        let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.facts_collection).await;
+        let _ = qdrant::delete_collection(
+            &http,
+            &cfg.qdrant_url,
+            &cfg.qdrant_api_key,
+            &cfg.chunks_collection,
+        )
+        .await;
+        let _ = qdrant::delete_collection(
+            &http,
+            &cfg.qdrant_url,
+            &cfg.qdrant_api_key,
+            &cfg.facts_collection,
+        )
+        .await;
         let engine = MemoryEngine::new(cfg.clone());
         if engine.ensure_collections().await.is_err() {
             println!("FAIL {} (collections)", sc.name);
@@ -198,8 +219,19 @@ async fn run_memtest(cfg: &EngineCfg) {
 
         let (_r, facts) = engine.retrieve_raw(sc.query, 10).await.unwrap_or_default();
         let joined = facts.join(" | ").to_lowercase();
-        let all = qdrant::scroll(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.facts_collection, 200).await.unwrap_or_default();
-        let superseded = all.iter().filter(|p| p["payload"]["is_latest"].as_bool() == Some(false)).count();
+        let all = qdrant::scroll(
+            &http,
+            &cfg.qdrant_url,
+            &cfg.qdrant_api_key,
+            &cfg.facts_collection,
+            200,
+        )
+        .await
+        .unwrap_or_default();
+        let superseded = all
+            .iter()
+            .filter(|p| p["payload"]["is_latest"].as_bool() == Some(false))
+            .count();
 
         let contains_ok = sc.must_contain.iter().all(|s| joined.contains(s));
         let absent_ok = sc.must_absent.iter().all(|s| !joined.contains(s));
@@ -211,23 +243,53 @@ async fn run_memtest(cfg: &EngineCfg) {
         println!("{} {}", if pass { "PASS" } else { "FAIL" }, sc.name);
         if !pass {
             if !contains_ok {
-                println!("     missing expected: {:?}", sc.must_contain.iter().filter(|s| !joined.contains(**s)).collect::<Vec<_>>());
+                println!(
+                    "     missing expected: {:?}",
+                    sc.must_contain
+                        .iter()
+                        .filter(|s| !joined.contains(**s))
+                        .collect::<Vec<_>>()
+                );
             }
             if !absent_ok {
-                println!("     leaked superseded: {:?}", sc.must_absent.iter().filter(|s| joined.contains(**s)).collect::<Vec<_>>());
+                println!(
+                    "     leaked superseded: {:?}",
+                    sc.must_absent
+                        .iter()
+                        .filter(|s| joined.contains(**s))
+                        .collect::<Vec<_>>()
+                );
             }
             if !superseded_ok {
                 println!("     expected a superseded memory, found none");
             }
-            println!("     latest facts: {}", joined.chars().take(200).collect::<String>());
+            println!(
+                "     latest facts: {}",
+                joined.chars().take(200).collect::<String>()
+            );
         }
 
-        let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.chunks_collection).await;
-        let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.facts_collection).await;
+        let _ = qdrant::delete_collection(
+            &http,
+            &cfg.qdrant_url,
+            &cfg.qdrant_api_key,
+            &cfg.chunks_collection,
+        )
+        .await;
+        let _ = qdrant::delete_collection(
+            &http,
+            &cfg.qdrant_url,
+            &cfg.qdrant_api_key,
+            &cfg.facts_collection,
+        )
+        .await;
     }
 
     println!("\n================ SCORE ================");
-    println!("  {passed}/{total} scenarios passed  ({}%)", passed * 100 / total.max(1));
+    println!(
+        "  {passed}/{total} scenarios passed  ({}%)",
+        passed * 100 / total.max(1)
+    );
 }
 
 // ============ SEED: ingest a committed corpus (reproducible bench setup) ============
@@ -246,7 +308,8 @@ async fn run_seed(engine: &Arc<MemoryEngine>, path: &str) {
             return;
         }
     };
-    let docs: Vec<SeedDoc> = serde_json::from_str(&raw).expect("parse seed corpus (expected [{title,content}])");
+    let docs: Vec<SeedDoc> =
+        serde_json::from_str(&raw).expect("parse seed corpus (expected [{title,content}])");
     let total = docs.len();
     println!("seeding {total} docs into '{}' …", engine_chunks_label());
     let sem = Arc::new(tokio::sync::Semaphore::new(6));
@@ -267,13 +330,20 @@ async fn run_seed(engine: &Arc<MemoryEngine>, path: &str) {
                 container_tag: String::new(),
             };
             match engine.add_document(&doc).await {
-                Ok(_) => { done.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                Ok(_) => {
+                    done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 Err(e) => eprintln!("  seed doc {i} failed: {e}"),
             }
         }));
     }
-    for h in handles { let _ = h.await; }
-    println!("seeded {}/{total} docs", done.load(std::sync::atomic::Ordering::Relaxed));
+    for h in handles {
+        let _ = h.await;
+    }
+    println!(
+        "seeded {}/{total} docs",
+        done.load(std::sync::atomic::Ordering::Relaxed)
+    );
 }
 
 fn engine_chunks_label() -> String {
@@ -305,7 +375,10 @@ async fn run_bench(engine: &MemoryEngine, cfg: &EngineCfg, build: bool) {
     let golden: Vec<GoldenItem> = match std::fs::read_to_string(&path) {
         Ok(s) => serde_json::from_str(&s).expect("parse golden.json"),
         Err(e) => {
-            eprintln!("no golden set at {} ({e}); run `probe bench build`", path.display());
+            eprintln!(
+                "no golden set at {} ({e}); run `probe bench build`",
+                path.display()
+            );
             return;
         }
     };
@@ -313,7 +386,11 @@ async fn run_bench(engine: &MemoryEngine, cfg: &EngineCfg, build: bool) {
         eprintln!("golden set is empty — ingest some documents first, then `probe bench build`");
         return;
     }
-    println!("benchmarking {} frozen queries from {}\n", golden.len(), path.display());
+    println!(
+        "benchmarking {} frozen queries from {}\n",
+        golden.len(),
+        path.display()
+    );
 
     // Approx GPT tokens from chars. Good enough for a relative trend metric.
     let approx_tokens = |chars: usize| (chars as f64 / 4.0).round() as usize;
@@ -342,19 +419,35 @@ async fn run_bench(engine: &MemoryEngine, cfg: &EngineCfg, build: bool) {
             let body: usize = r.chunks.iter().map(|c| c.content.chars().count()).sum();
             ctx_chars += body.min(900);
         }
-        ctx_chars += facts.iter().take(10).map(|f| f.chars().count()).sum::<usize>();
+        ctx_chars += facts
+            .iter()
+            .take(10)
+            .map(|f| f.chars().count())
+            .sum::<usize>();
         tokens.push(approx_tokens(ctx_chars));
 
-        let top1 = docs.first().and_then(|d| d.title.clone()).unwrap_or_default();
+        let top1 = docs
+            .first()
+            .and_then(|d| d.title.clone())
+            .unwrap_or_default();
         lines.push((rank, item.title.clone(), top1));
     }
 
     lines.sort_by_key(|l| l.0);
     for (rank, title, top1) in &lines {
-        let tag = if *rank == 1 { "#1  ".into() } else if *rank > 0 { format!("#{rank}  ") } else { "MISS".to_string() };
+        let tag = if *rank == 1 {
+            "#1  ".into()
+        } else if *rank > 0 {
+            format!("#{rank}  ")
+        } else {
+            "MISS".to_string()
+        };
         println!("{:<5} {}", tag, title.chars().take(58).collect::<String>());
         if *rank < 0 || *rank > 3 {
-            println!("        instead: {}", top1.chars().take(58).collect::<String>());
+            println!(
+                "        instead: {}",
+                top1.chars().take(58).collect::<String>()
+            );
         }
     }
 
@@ -363,12 +456,30 @@ async fn run_bench(engine: &MemoryEngine, cfg: &EngineCfg, build: bool) {
     let h3 = ranks.iter().filter(|r| (1..=3).contains(*r)).count();
     let h10 = ranks.iter().filter(|r| (1..=10).contains(*r)).count();
     let miss = ranks.iter().filter(|r| **r < 0).count();
-    let mrr: f64 = ranks.iter().filter(|r| **r > 0).map(|r| 1.0 / *r as f64).sum::<f64>() / n as f64;
-    let mean = |v: &[u128]| if v.is_empty() { 0 } else { v.iter().sum::<u128>() / v.len() as u128 };
+    let mrr: f64 = ranks
+        .iter()
+        .filter(|r| **r > 0)
+        .map(|r| 1.0 / *r as f64)
+        .sum::<f64>()
+        / n as f64;
+    let mean = |v: &[u128]| {
+        if v.is_empty() {
+            0
+        } else {
+            v.iter().sum::<u128>() / v.len() as u128
+        }
+    };
     let mut lat_sorted = latencies_ms.clone();
     lat_sorted.sort_unstable();
-    let p95 = lat_sorted.get((lat_sorted.len() * 95 / 100).min(lat_sorted.len().saturating_sub(1))).copied().unwrap_or(0);
-    let mean_tokens = if tokens.is_empty() { 0 } else { tokens.iter().sum::<usize>() / tokens.len() };
+    let p95 = lat_sorted
+        .get((lat_sorted.len() * 95 / 100).min(lat_sorted.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or(0);
+    let mean_tokens = if tokens.is_empty() {
+        0
+    } else {
+        tokens.iter().sum::<usize>() / tokens.len()
+    };
 
     println!("\n================ BENCH ({} queries) ================", n);
     println!("  H@1 (rank 1):     {h1}  ({}%)", h1 * 100 / n);
@@ -386,10 +497,18 @@ async fn run_bench(engine: &MemoryEngine, cfg: &EngineCfg, build: bool) {
     let lat_factor = (2000.0 / mean_lat.max(1.0)).clamp(0.5, 1.0);
     let tok_factor = (2000.0 / (mean_tokens as f64).max(1.0)).clamp(0.5, 1.0);
     let memscore = (100.0 * mrr * (0.7 + 0.15 * lat_factor + 0.15 * tok_factor)).round();
-    println!("  MemScore:         {memscore}/100  (quality {:.0} × efficiency)", mrr * 100.0);
+    println!(
+        "  MemScore:         {memscore}/100  (quality {:.0} × efficiency)",
+        mrr * 100.0
+    );
     println!("  --- copy this line to track deltas ---");
-    println!("  H@1={}% H@3={}% H@10={}% MRR={mrr:.3} lat={}ms tok={mean_tokens} mem={memscore}",
-        h1 * 100 / n, h3 * 100 / n, h10 * 100 / n, mean(&latencies_ms));
+    println!(
+        "  H@1={}% H@3={}% H@10={}% MRR={mrr:.3} lat={}ms tok={mean_tokens} mem={memscore}",
+        h1 * 100 / n,
+        h3 * 100 / n,
+        h10 * 100 / n,
+        mean(&latencies_ms)
+    );
 }
 
 /// Build (freeze) the golden set: deterministic doc sample + one generated query
@@ -398,7 +517,10 @@ async fn run_bench(engine: &MemoryEngine, cfg: &EngineCfg, build: bool) {
 /// `list_document_ids` (no external store) and generates queries with the
 /// engine's own `LlmClient` (`cfg.plan_model`).
 async fn build_golden(engine: &MemoryEngine, cfg: &EngineCfg, path: &std::path::Path) {
-    let n: usize = std::env::args().nth(3).and_then(|a| a.parse().ok()).unwrap_or(60);
+    let n: usize = std::env::args()
+        .nth(3)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(60);
     let mut rows = engine
         .list_document_ids(DEFAULT_TAG, None, 100_000)
         .await
@@ -407,7 +529,11 @@ async fn build_golden(engine: &MemoryEngine, cfg: &EngineCfg, path: &std::path::
     let total = rows.len();
     let stride = (total / n.max(1)).max(1);
     let sample: Vec<_> = rows.iter().step_by(stride).take(n).cloned().collect();
-    println!("freezing {} golden queries from {} indexed docs…", sample.len(), total);
+    println!(
+        "freezing {} golden queries from {} indexed docs…",
+        sample.len(),
+        total
+    );
 
     let llm = LlmClient::new();
     let http = reqwest::Client::new();
@@ -415,7 +541,13 @@ async fn build_golden(engine: &MemoryEngine, cfg: &EngineCfg, path: &std::path::
     let out = Arc::new(tokio::sync::Mutex::new(Vec::<GoldenItem>::new()));
     let mut handles = Vec::new();
     for (doc_id, title, _source, _reference, _captured_at) in sample {
-        let (cfg, llm, http, sem, out) = (cfg.clone(), llm.clone(), http.clone(), sem.clone(), out.clone());
+        let (cfg, llm, http, sem, out) = (
+            cfg.clone(),
+            llm.clone(),
+            http.clone(),
+            sem.clone(),
+            out.clone(),
+        );
         handles.push(tokio::spawn(async move {
             let _p = sem.acquire_owned().await.unwrap();
             let chunks = qdrant::chunks_of_doc(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.chunks_collection, &doc_id, 2).await.unwrap_or_default();
@@ -430,15 +562,22 @@ async fn build_golden(engine: &MemoryEngine, cfg: &EngineCfg, path: &std::path::
             out.lock().await.push(GoldenItem { query, doc_id, title });
         }));
     }
-    for h in handles { let _ = h.await; }
+    for h in handles {
+        let _ = h.await;
+    }
 
     let mut golden = Arc::try_unwrap(out).unwrap().into_inner();
     golden.sort_by(|a, b| a.doc_id.cmp(&b.doc_id)); // stable order
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(path, serde_json::to_string_pretty(&golden).unwrap()).expect("write golden.json");
-    println!("wrote {} golden queries to {}", golden.len(), path.display());
+    std::fs::write(path, serde_json::to_string_pretty(&golden).unwrap())
+        .expect("write golden.json");
+    println!(
+        "wrote {} golden queries to {}",
+        golden.len(),
+        path.display()
+    );
 }
 
 // ============ REINDEX: reprocess without re-extracting ============
@@ -474,7 +613,9 @@ async fn run_reindex(engine: &Arc<MemoryEngine>, cfg: &EngineCfg) {
             }
         }
         "facts" => {
-            let tag = std::env::args().nth(3).unwrap_or_else(|| DEFAULT_TAG.to_string());
+            let tag = std::env::args()
+                .nth(3)
+                .unwrap_or_else(|| DEFAULT_TAG.to_string());
             reindex_facts(engine, cfg, &tag).await;
         }
         _ => {
@@ -508,13 +649,22 @@ async fn reindex_facts(engine: &Arc<MemoryEngine>, _cfg: &EngineCfg, tag: &str) 
                 .await;
             let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             match r {
-                Ok(facts) => { if n % 50 == 0 || n == total { println!("  {n}/{total} done ({facts} facts last)"); } }
+                Ok(facts) => {
+                    if n % 50 == 0 || n == total {
+                        println!("  {n}/{total} done ({facts} facts last)");
+                    }
+                }
                 Err(e) => eprintln!("  doc {doc_id} failed: {e}"),
             }
         }));
     }
-    for h in handles { let _ = h.await; }
-    println!("re-distill complete: {} docs processed", done.load(std::sync::atomic::Ordering::Relaxed));
+    for h in handles {
+        let _ = h.await;
+    }
+    println!(
+        "re-distill complete: {} docs processed",
+        done.load(std::sync::atomic::Ordering::Relaxed)
+    );
 }
 
 // ============ A/B RE-INDEX BENCHMARK: ingest-side features ============
@@ -592,10 +742,25 @@ async fn abtest_variant(
     cfg.chunks_collection = "ultramem_ab_chunks".into();
     cfg.facts_collection = "ultramem_ab_facts".into();
     let http = reqwest::Client::new();
-    let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.chunks_collection).await;
-    let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.facts_collection).await;
+    let _ = qdrant::delete_collection(
+        &http,
+        &cfg.qdrant_url,
+        &cfg.qdrant_api_key,
+        &cfg.chunks_collection,
+    )
+    .await;
+    let _ = qdrant::delete_collection(
+        &http,
+        &cfg.qdrant_url,
+        &cfg.qdrant_api_key,
+        &cfg.facts_collection,
+    )
+    .await;
     let engine = Arc::new(MemoryEngine::new(cfg.clone()));
-    engine.ensure_collections().await.expect("ensure ab collections");
+    engine
+        .ensure_collections()
+        .await
+        .expect("ensure ab collections");
 
     // Ingest, recording each item's new doc_id (parallel, bounded).
     let sem = Arc::new(tokio::sync::Semaphore::new(8));
@@ -628,13 +793,23 @@ async fn abtest_variant(
     let doc_ids = Arc::new(doc_ids);
     let mut qhandles = Vec::new();
     for (i, item) in corpus.iter().enumerate() {
-        let (engine, sem, doc_ids, query) = (engine.clone(), sem.clone(), doc_ids.clone(), item.query.clone());
+        let (engine, sem, doc_ids, query) = (
+            engine.clone(),
+            sem.clone(),
+            doc_ids.clone(),
+            item.query.clone(),
+        );
         qhandles.push(tokio::spawn(async move {
             let _p = sem.acquire_owned().await.unwrap();
-            let Some(expected) = doc_ids[i].clone() else { return None };
+            let expected = doc_ids[i].clone()?;
             // Planner-free: isolate the ingest-side variable, no planner noise.
             let (docs, _) = engine.retrieve_raw(&query, 10).await.unwrap_or_default();
-            Some(docs.iter().position(|d| d.document_id == expected).map(|p| p as i32 + 1).unwrap_or(-1))
+            Some(
+                docs.iter()
+                    .position(|d| d.document_id == expected)
+                    .map(|p| p as i32 + 1)
+                    .unwrap_or(-1),
+            )
         }));
     }
     let mut ranks: Vec<i32> = Vec::new();
@@ -644,14 +819,31 @@ async fn abtest_variant(
         }
     }
 
-    let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.chunks_collection).await;
-    let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.facts_collection).await;
+    let _ = qdrant::delete_collection(
+        &http,
+        &cfg.qdrant_url,
+        &cfg.qdrant_api_key,
+        &cfg.chunks_collection,
+    )
+    .await;
+    let _ = qdrant::delete_collection(
+        &http,
+        &cfg.qdrant_url,
+        &cfg.qdrant_api_key,
+        &cfg.facts_collection,
+    )
+    .await;
 
     let n = ranks.len().max(1);
     let h1 = ranks.iter().filter(|r| **r == 1).count() * 100 / n;
     let h3 = ranks.iter().filter(|r| (1..=3).contains(*r)).count() * 100 / n;
     let h10 = ranks.iter().filter(|r| (1..=10).contains(*r)).count() * 100 / n;
-    let mrr: f64 = ranks.iter().filter(|r| **r > 0).map(|r| 1.0 / *r as f64).sum::<f64>() / n as f64;
+    let mrr: f64 = ranks
+        .iter()
+        .filter(|r| **r > 0)
+        .map(|r| 1.0 / *r as f64)
+        .sum::<f64>()
+        / n as f64;
     (h1, h3, h10, mrr)
 }
 
@@ -663,21 +855,33 @@ async fn run_abtest(engine: &MemoryEngine, cfg: &EngineCfg, build: bool) {
     let mut corpus: Vec<CorpusItem> = match std::fs::read_to_string(&path) {
         Ok(s) => serde_json::from_str(&s).expect("parse corpus.json"),
         Err(e) => {
-            eprintln!("no corpus at {} ({e}); run `probe abtest build`", path.display());
+            eprintln!(
+                "no corpus at {} ({e}); run `probe abtest build`",
+                path.display()
+            );
             return;
         }
     };
     if corpus.is_empty() {
-        eprintln!("corpus is empty — ingest some documents first, then `probe abtest <feat> build`");
+        eprintln!(
+            "corpus is empty — ingest some documents first, then `probe abtest <feat> build`"
+        );
         return;
     }
     // ULTRAMEM_AB_LIMIT caps corpus size — smaller = faster, still has distractors.
-    if let Ok(lim) = std::env::var("ULTRAMEM_AB_LIMIT").map(|v| v.parse::<usize>().unwrap_or(usize::MAX)) {
+    if let Ok(lim) =
+        std::env::var("ULTRAMEM_AB_LIMIT").map(|v| v.parse::<usize>().unwrap_or(usize::MAX))
+    {
         corpus.truncate(lim);
     }
     // `probe abtest <feature> [build]` (defaults to contextual).
     let feature = Feature::parse(&std::env::args().nth(2).unwrap_or_default());
-    println!("A/B [{}] over {} docs from {}\n", feature.label(), corpus.len(), path.display());
+    println!(
+        "A/B [{}] over {} docs from {}\n",
+        feature.label(),
+        corpus.len(),
+        path.display()
+    );
 
     println!("running BASELINE ({} OFF)…", feature.label());
     let (b1, b3, b10, bmrr) = abtest_variant(cfg, &corpus, feature, false).await;
@@ -685,19 +889,28 @@ async fn run_abtest(engine: &MemoryEngine, cfg: &EngineCfg, build: bool) {
     let (e1, e3, e10, emrr) = abtest_variant(cfg, &corpus, feature, true).await;
 
     let d = |a: usize, b: usize| -> String { format!("{:+}", b as i64 - a as i64) };
-    println!("\n================ A/B RESULTS [{}] ================", feature.label());
+    println!(
+        "\n================ A/B RESULTS [{}] ================",
+        feature.label()
+    );
     println!("                 baseline   enhanced   delta");
     println!("  H@1            {b1:>5}%    {e1:>5}%    {}", d(b1, e1));
     println!("  H@3            {b3:>5}%    {e3:>5}%    {}", d(b3, e3));
     println!("  H@10           {b10:>5}%    {e10:>5}%    {}", d(b10, e10));
-    println!("  MRR            {bmrr:>6.3}   {emrr:>6.3}   {:+.3}", emrr - bmrr);
+    println!(
+        "  MRR            {bmrr:>6.3}   {emrr:>6.3}   {:+.3}",
+        emrr - bmrr
+    );
 }
 
 /// Freeze the A/B corpus: sample N indexed docs, reconstruct each one's text
 /// from its chunks (in index order), generate one query each. Stored so the
 /// corpus and queries never change between runs.
 async fn build_corpus(engine: &MemoryEngine, cfg: &EngineCfg, path: &std::path::Path) {
-    let n: usize = std::env::args().nth(3).and_then(|a| a.parse().ok()).unwrap_or(60);
+    let n: usize = std::env::args()
+        .nth(3)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(60);
     let mut rows = engine
         .list_document_ids(DEFAULT_TAG, None, 100_000)
         .await
@@ -714,7 +927,13 @@ async fn build_corpus(engine: &MemoryEngine, cfg: &EngineCfg, path: &std::path::
     let out = Arc::new(tokio::sync::Mutex::new(Vec::<CorpusItem>::new()));
     let mut handles = Vec::new();
     for (doc_id, title, _source, _reference, _captured_at) in sample {
-        let (cfg, llm, http, sem, out) = (cfg.clone(), llm.clone(), http.clone(), sem.clone(), out.clone());
+        let (cfg, llm, http, sem, out) = (
+            cfg.clone(),
+            llm.clone(),
+            http.clone(),
+            sem.clone(),
+            out.clone(),
+        );
         handles.push(tokio::spawn(async move {
             let _p = sem.acquire_owned().await.unwrap();
             // Reconstruct the document's indexed text in chunk order.
@@ -732,11 +951,16 @@ async fn build_corpus(engine: &MemoryEngine, cfg: &EngineCfg, path: &std::path::
             out.lock().await.push(CorpusItem { title, query, content });
         }));
     }
-    for h in handles { let _ = h.await; }
+    for h in handles {
+        let _ = h.await;
+    }
 
     let mut corpus = Arc::try_unwrap(out).unwrap().into_inner();
     corpus.sort_by(|a, b| a.title.cmp(&b.title));
-    if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
-    std::fs::write(path, serde_json::to_string_pretty(&corpus).unwrap()).expect("write corpus.json");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&corpus).unwrap())
+        .expect("write corpus.json");
     println!("wrote {} corpus docs to {}", corpus.len(), path.display());
 }

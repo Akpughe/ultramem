@@ -14,7 +14,10 @@ pub struct MistralOcr {
 
 impl MistralOcr {
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self { http: reqwest::Client::new(), api_key: api_key.into() }
+        Self {
+            http: reqwest::Client::new(),
+            api_key: api_key.into(),
+        }
     }
 }
 

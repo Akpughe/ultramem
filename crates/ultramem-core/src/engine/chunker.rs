@@ -32,10 +32,13 @@ pub fn chunk_doc(content: &str, source: &str, file_path: Option<&str>, smart: bo
 /// Heuristic: several Markdown headings present even without a .md extension
 /// (browser-captured articles, pasted docs).
 fn looks_like_markdown(text: &str) -> bool {
-    text.lines().filter(|l| {
-        let t = l.trim_start();
-        t.starts_with("# ") || t.starts_with("## ") || t.starts_with("### ")
-    }).count() >= 2
+    text.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("# ") || t.starts_with("## ") || t.starts_with("### ")
+        })
+        .count()
+        >= 2
 }
 
 /// Split `text` into chunks of roughly `target` chars. Paragraphs are kept
@@ -105,8 +108,16 @@ pub fn chunk_markdown(text: &str, target: usize, overlap: usize) -> Vec<String> 
         if b.is_empty() {
             return;
         }
-        let crumb = trail.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" ▸ ");
-        let section = if crumb.is_empty() { b.to_string() } else { format!("{crumb}\n{b}") };
+        let crumb = trail
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join(" ▸ ");
+        let section = if crumb.is_empty() {
+            b.to_string()
+        } else {
+            format!("{crumb}\n{b}")
+        };
         if section.chars().count() <= target {
             pieces.push(section);
         } else {
@@ -177,12 +188,22 @@ pub fn chunk_transcript(text: &str, target: usize, overlap: usize) -> Vec<String
 fn is_speaker_line(line: &str) -> bool {
     let l = line.trim_start();
     // strip a leading [..] or (..) timestamp
-    let l = l.strip_prefix('[').and_then(|r| r.split_once(']')).map(|(_, r)| r.trim_start()).unwrap_or(l);
-    let Some((label, _rest)) = l.split_once(':') else { return false };
+    let l = l
+        .strip_prefix('[')
+        .and_then(|r| r.split_once(']'))
+        .map(|(_, r)| r.trim_start())
+        .unwrap_or(l);
+    let Some((label, _rest)) = l.split_once(':') else {
+        return false;
+    };
     let label = label.trim();
     !label.is_empty()
         && label.chars().count() <= 32
-        && label.chars().next().map(|c| c.is_uppercase() || c.is_ascii_digit()).unwrap_or(false)
+        && label
+            .chars()
+            .next()
+            .map(|c| c.is_uppercase() || c.is_ascii_digit())
+            .unwrap_or(false)
         && label.split_whitespace().count() <= 3
         && !label.contains(['.', '!', '?', ','])
 }
@@ -243,10 +264,18 @@ mod tests {
         let para = "The quick brown fox jumps over the lazy dog. ".repeat(20); // ~920 chars
         let text = vec![para; 6].join("\n\n");
         let chunks = chunk_text(&text, 1200, 200);
-        assert!(chunks.len() >= 3, "expected several chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 3,
+            "expected several chunks, got {}",
+            chunks.len()
+        );
         for c in &chunks {
             // target + overlap seed + joining slack
-            assert!(c.chars().count() <= 1200 + 200 + 4, "chunk too big: {}", c.chars().count());
+            assert!(
+                c.chars().count() <= 1200 + 200 + 4,
+                "chunk too big: {}",
+                c.chars().count()
+            );
         }
     }
 
@@ -255,7 +284,10 @@ mod tests {
         let para = "Sentence one is here. ".repeat(120); // ~2640 chars, one paragraph
         let chunks = chunk_text(&para, 1200, 200);
         assert!(chunks.len() >= 2);
-        let tail: String = chunks[0].chars().skip(chunks[0].chars().count().saturating_sub(50)).collect();
+        let tail: String = chunks[0]
+            .chars()
+            .skip(chunks[0].chars().count().saturating_sub(50))
+            .collect();
         assert!(
             chunks[1].contains(tail.trim()),
             "second chunk should contain the tail of the first"
@@ -269,7 +301,11 @@ mod tests {
         assert!(chunks.len() >= 4);
         for c in &chunks {
             // target + overlap seed + joining slack
-            assert!(c.chars().count() <= 1200 + 200 + 4, "chunk too big: {}", c.chars().count());
+            assert!(
+                c.chars().count() <= 1200 + 200 + 4,
+                "chunk too big: {}",
+                c.chars().count()
+            );
         }
     }
 
@@ -286,7 +322,10 @@ mod tests {
         let chunks = chunk_markdown(md, 1200, 200);
         // Small sections pack into one chunk here; the heading crumbs must appear.
         let joined = chunks.join("\n");
-        assert!(joined.contains("# Guide"), "heading trail missing: {joined}");
+        assert!(
+            joined.contains("# Guide"),
+            "heading trail missing: {joined}"
+        );
         assert!(joined.contains("## Setup"));
         assert!(joined.contains("install the thing"));
     }
@@ -315,7 +354,11 @@ mod tests {
         assert!(is_speaker_line("[00:12] Jordan: hi"));
         assert!(!is_speaker_line("This is a sentence: with a colon."));
         let chunks = chunk_transcript(t, 80, 10); // tiny target → one chunk per turn-ish
-        assert!(chunks.len() >= 2, "expected multiple speaker chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "expected multiple speaker chunks, got {}",
+            chunks.len()
+        );
     }
 
     #[test]
