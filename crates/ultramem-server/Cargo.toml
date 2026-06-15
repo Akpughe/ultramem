@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 ultramem-core = { path = "../ultramem-core" }
-axum = "0.7"
+axum = { version = "0.7", features = ["multipart"] }
 tokio.workspace = true
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 serde.workspace = true

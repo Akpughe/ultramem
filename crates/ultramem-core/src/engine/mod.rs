@@ -523,6 +523,40 @@ impl MemoryEngine {
         Ok(doc_id)
     }
 
+    /// Ingest a web page: fetch + clean it via Jina Reader, then run the normal
+    /// pipeline (chunk → embed → distill → reconcile). `tag` empty = default
+    /// namespace. Returns the new document id. Errors if the page yields no text.
+    pub async fn add_url(
+        &self,
+        url: &str,
+        title: Option<String>,
+        tag: &str,
+        captured_at: i64,
+    ) -> Result<String, String> {
+        let cfg = self.cfg();
+        let body = extract::jina_url(&self.http, &cfg.jina_api_key, url).await?;
+        if body.trim().is_empty() {
+            return Err(format!("no extractable text at {url}"));
+        }
+        let title = title.unwrap_or_default();
+        let header = if title.is_empty() {
+            url.to_string()
+        } else {
+            format!("{title} — {url}")
+        };
+        let doc = IngestDoc {
+            source: "web".into(),
+            title,
+            content: format!("{header}\n\n{body}"),
+            reference: url.to_string(),
+            app: String::new(),
+            captured_at,
+            file_path: None,
+            container_tag: tag.to_string(),
+        };
+        self.add_document(&doc).await
+    }
+
     /// Index a document's distilled facts as memories, reconciling each against
     /// existing memories (the lifecycle in `memory.rs`): dedup, UPDATE (flip the
     /// old memory's is_latest), EXTEND (edge), or NEW. When `memory_graph` is

@@ -12,20 +12,32 @@ Design goal: mirror SuperMemory's surface so it's a drop-in mental model, backed
 ## Endpoints
 
 ### `POST /v1/memories` — ingest
-Body (JSON, or `multipart/form-data` for files):
+The endpoint dispatches on `Content-Type`. Provide exactly one source of content.
+
+**JSON** (`application/json`) — one of `content`, `url`, or `file_path`:
 ```jsonc
 {
-  "content": "string",           // text/markdown, OR
-  "url": "https://…",            // fetch + clean (Jina Reader), OR (multipart) a file part
+  "content": "string",           // raw text/markdown, OR
+  "url": "https://…",            // fetch + clean the page (Jina Reader), OR
+  "file_path": "/path/on/server",// a file on the SERVER's filesystem (local/embedded use)
   "title": "string?",
-  "source": "clipboard|browser|file|meeting|api",
+  "source": "clipboard|browser|file|meeting|api|web",
   "reference": "string?",        // canonical id/url
   "container_tag": "string?",
-  "captured_at": 1760000000,      // unix; default now
-  "metadata": { }
+  "captured_at": 1760000000       // unix; default now
 }
 ```
-→ `{ "document_id": "uuid", "status": "done" }`. Returning `done` means chunks are searchable; fact distillation + lifecycle run inline (non-fatal). Maps to `MemoryEngine::add_document`.
+
+**File upload** (`multipart/form-data`) — to send a file's bytes from a client.
+A `file` part (PDF/image/Office/text — OCR'd or text-extracted server-side via
+Mistral/Jina Reader) plus optional text fields `title`, `source`, `reference`,
+`container_tag`, `captured_at`:
+```
+file=@report.pdf  title=Q3 report  container_tag=user_123
+```
+Upload size cap: 32 MB.
+
+→ `{ "document_id": "uuid", "status": "done" }` (any mode). Returning `done` means chunks are searchable; fact distillation + lifecycle run inline (non-fatal). Maps to `MemoryEngine::add_document` (text/file) / `add_url` (url). Distillation only runs for content longer than ~280 chars.
 
 ### `POST /v1/search` — hybrid retrieve
 ```jsonc
@@ -88,6 +100,21 @@ curl -sX POST localhost:8080/v1/memories -H "Authorization: Bearer $KEY" \
     "container_tag": "user_123"
   }'
 # → {"document_id":"db0eb2a4-7888-4d1f-a12f-7183f295bd31","status":"done"}
+```
+
+**Upload a file** — `POST /v1/memories` (multipart; PDF/image/Office/text)
+```bash
+curl -sX POST localhost:8080/v1/memories -H "Authorization: Bearer $KEY" \
+  -F "file=@report.pdf" -F "title=Q3 report" -F "container_tag=user_123"
+# → {"document_id":"ba70cf15-…","status":"done"}   # PDF/image → Mistral OCR; text/Office → extracted
+```
+
+**Ingest a URL** — `POST /v1/memories` (fetched + cleaned via Jina Reader)
+```bash
+curl -sX POST localhost:8080/v1/memories -H "Authorization: Bearer $KEY" \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://example.com/article","container_tag":"user_123"}'
+# → {"document_id":"522c61ef-…","status":"done"}   # source recorded as "web"
 ```
 
 **Search** — `POST /v1/search` (returns the document *and* distilled facts)
