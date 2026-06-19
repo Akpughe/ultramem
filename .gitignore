@@ -7,3 +7,13 @@ Cargo.lock
 # Generated eval artifacts (corpus_demo.json is the committed source corpus).
 eval/golden*.json
 eval/corpus.json
+
+# LongMemEval dataset (large, downloaded; not committed)
+eval/longmemeval*.json
+.gstack/
+
+# LongMemEval per-run result dumps (generated; corpus_demo.json stays tracked).
+eval/lme*.json
+
+# Standalone Next.js docs site (separate concern; has its own node_modules).
+web/

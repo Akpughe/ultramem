@@ -1,6 +1,10 @@
 FROM rust:1-slim AS build
 WORKDIR /app
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+# Resilience against crates.io HTTP/2 framing flakes during Docker builds.
+ENV CARGO_NET_RETRY=10 \
+    CARGO_HTTP_MULTIPLEXING=false \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 COPY . .
 RUN cargo build --release -p ultramem-server
 
