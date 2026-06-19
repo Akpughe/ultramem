@@ -20,13 +20,74 @@ pub fn chunk_doc(content: &str, source: &str, file_path: Option<&str>, smart: bo
             p.ends_with(".md") || p.ends_with(".markdown") || p.ends_with(".mdx")
         })
         .unwrap_or(false);
-    if source == "meeting" {
+    if source == "chat" || looks_like_conversation(content) {
+        // LongMemEval "round granularity": keep each Q&A round as one retrievable
+        // unit so an answer detail never ends up split across paragraph chunks.
+        chunk_rounds(content, CHUNK_TARGET, CHUNK_OVERLAP)
+    } else if source == "meeting" {
         chunk_transcript(content, CHUNK_TARGET, CHUNK_OVERLAP)
     } else if is_md || looks_like_markdown(content) {
         chunk_markdown(content, CHUNK_TARGET, CHUNK_OVERLAP)
     } else {
         chunk_text(content, CHUNK_TARGET, CHUNK_OVERLAP)
     }
+}
+
+/// Heuristic: content is a chat transcript — several lines begin with a
+/// `user:` / `assistant:` (or `human:`/`ai:`) role prefix.
+fn looks_like_conversation(text: &str) -> bool {
+    let role_lines = text
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start().to_lowercase();
+            t.starts_with("user:")
+                || t.starts_with("assistant:")
+                || t.starts_with("human:")
+                || t.starts_with("ai:")
+        })
+        .count();
+    role_lines >= 2
+}
+
+/// Round-level chunking for conversational content: one chunk per round (a user
+/// message plus the assistant turn(s) answering it). Keeps a Q&A pair together
+/// as a single retrievable unit. Oversized rounds split by paragraph; content
+/// without real round structure falls back to paragraph packing.
+pub fn chunk_rounds(text: &str, target: usize, overlap: usize) -> Vec<String> {
+    let mut rounds: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    for line in text.lines() {
+        let t = line.trim_start().to_lowercase();
+        let is_user = t.starts_with("user:") || t.starts_with("human:");
+        // A new round begins at each user turn (after we've accumulated one).
+        if is_user && started && !cur.trim().is_empty() {
+            rounds.push(std::mem::take(&mut cur));
+        }
+        cur.push_str(line);
+        cur.push('\n');
+        started = true;
+    }
+    if !cur.trim().is_empty() {
+        rounds.push(cur);
+    }
+    // Not really round-structured → paragraph fallback.
+    if rounds.len() < 2 {
+        return chunk_text(text, target, overlap);
+    }
+    let mut out = Vec::new();
+    for r in rounds {
+        let r = r.trim();
+        if r.is_empty() {
+            continue;
+        }
+        if r.chars().count() > target {
+            out.extend(chunk_text(r, target, overlap));
+        } else {
+            out.push(r.to_string());
+        }
+    }
+    out
 }
 
 /// Heuristic: several Markdown headings present even without a .md extension
@@ -252,6 +313,38 @@ mod tests {
     fn short_text_is_one_chunk() {
         let chunks = chunk_text("hello world", 1200, 200);
         assert_eq!(chunks, vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn rounds_one_chunk_per_qa_pair() {
+        let convo = "user: where did I buy coffee?\nassistant: You bought it at Target.\n\
+                     user: what about the creamer?\nassistant: Also at Target, with a $5 coupon.";
+        let chunks = chunk_rounds(convo, 1200, 200);
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected one chunk per round, got {chunks:?}"
+        );
+        assert!(chunks[0].contains("coffee") && chunks[0].contains("Target"));
+        assert!(chunks[1].contains("creamer") && chunks[1].contains("coupon"));
+    }
+
+    #[test]
+    fn chat_source_routes_to_rounds() {
+        let convo = "user: q1\nassistant: a1\nuser: q2\nassistant: a2\nuser: q3\nassistant: a3";
+        // Whole thing is short, but round-chunking still yields one unit per round.
+        assert_eq!(chunk_doc(convo, "chat", None, true).len(), 3);
+        assert!(looks_like_conversation(convo));
+        assert!(!looks_like_conversation("just some prose with no roles"));
+    }
+
+    #[test]
+    fn non_conversational_falls_back_to_paragraph() {
+        // Round chunker on plain prose → single paragraph chunk (no round structure).
+        assert_eq!(
+            chunk_rounds("a single paragraph of prose", 1200, 200).len(),
+            1
+        );
     }
 
     #[test]

@@ -73,6 +73,13 @@ pub struct EngineCfg {
     /// doc-level situating blurb (see `context.rs`). On in production; the A/B
     /// bench flips it to isolate the effect.
     pub contextual: bool,
+    /// Fact-augmented keys (LongMemEval +9.4% recall): distill the document's
+    /// facts BEFORE embedding chunks and fold a compact fact summary into each
+    /// chunk's embedding key (stored content stays raw; the distilled facts are
+    /// reused for memory indexing — no second distill pass). OFF by default so
+    /// production keeps the "chunks searchable immediately" order (distill runs
+    /// after upsert); turning it on makes distillation block the chunk path.
+    pub fact_augmented_keys: bool,
     /// Run fact distillation at ingest. On in production; the A/B bench turns
     /// it off so a chunk-retrieval comparison isn't slowed by the (unrelated)
     /// distillation passes.
@@ -119,6 +126,7 @@ impl Default for EngineCfg {
             // no doc-level retrieval gain (slightly negative) for a per-doc LLM
             // cost. Kept behind the flag to revisit with a chunk-level metric.
             contextual: false,
+            fact_augmented_keys: false,
             distill: true,
             memory_graph: true,
             smart_chunking: true,
@@ -451,20 +459,62 @@ impl MemoryEngine {
             return Err("empty content".into());
         }
 
+        // 2b. Fact-augmented keys (T1.2): when enabled, distill the doc's facts
+        // BEFORE embedding so a compact fact summary can enrich each chunk's
+        // embedding key (paper: +9.4% recall@k). The facts are reused for memory
+        // indexing below — no second distill. Off by default (production keeps
+        // the distill-after-upsert order so chunks are searchable immediately).
+        let do_distill = cfg.distill && content.chars().count() >= 280;
+        let early_facts: Option<Vec<String>> = if cfg.fact_augmented_keys && do_distill {
+            Some(
+                distill::distill_facts(
+                    self.llm.as_ref(),
+                    &cfg.distill_model,
+                    &doc.title,
+                    &content,
+                    &date_str(doc.captured_at),
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("[recally] distill failed for '{}': {e}", doc.title);
+                    vec![]
+                }),
+            )
+        } else {
+            None
+        };
+
         // 3. Embed. Titles and filenames carry meaning the body often never
         // repeats ("newton-profile.pdf" describes every page of it), so every
         // chunk's embedding input is prefixed with a readable form of the
-        // title. Contextual Retrieval adds a one-line doc-level blurb on top
-        // (see `context.rs`) so each chunk embeds with awareness of the whole
-        // document. The stored chunk text stays clean — this only shapes vectors.
+        // title. Contextual Retrieval adds a one-line doc-level blurb, and
+        // fact-augmented keys add a compact distilled-fact summary, on top — so
+        // each chunk embeds with awareness of the whole document. The stored
+        // chunk text stays clean — this only shapes vectors.
         let blurb = if cfg.contextual {
             context::doc_context(self.llm.as_ref(), &cfg.distill_model, &doc.title, &content).await
         } else {
             None
         };
+        let fact_key = early_facts.as_ref().filter(|f| !f.is_empty()).map(|f| {
+            f.iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+                .chars()
+                .take(600)
+                .collect::<String>()
+        });
+        let augmentation = match (blurb, fact_key) {
+            (Some(b), Some(f)) => Some(format!("{b}\n{f}")),
+            (Some(b), None) => Some(b),
+            (None, Some(f)) => Some(f),
+            (None, None) => None,
+        };
         let inputs: Vec<String> = chunks
             .iter()
-            .map(|c| embed_input(&doc.title, blurb.as_deref(), c))
+            .map(|c| embed_input(&doc.title, augmentation.as_deref(), c))
             .collect();
         let vectors = self.embedder.embed(EmbedTask::Passage, &inputs).await?;
 
@@ -501,23 +551,40 @@ impl MemoryEngine {
             .collect();
         self.store.upsert(&cfg.chunks_collection, points).await?;
 
-        // 5. Distill facts (non-fatal; chunks are already in). Tiny captures —
-        // one-line browser visits, short clips — carry no facts beyond their
-        // own text, which is already embedded; skipping them roughly halves
-        // backfill time and cost.
-        if !cfg.distill || content.chars().count() < 280 {
-            return Ok(doc_id);
-        }
-        match distill::distill_facts(self.llm.as_ref(), &cfg.distill_model, &doc.title, &content)
-            .await
-        {
-            Ok(facts) if !facts.is_empty() => {
-                if let Err(e) = self.index_memories(&cfg, doc, &doc_id, facts).await {
-                    eprintln!("[recally] memory indexing failed for '{}': {e}", doc.title);
+        // 5. Index memories. Tiny captures carry no facts beyond their own text
+        // (already embedded), so distillation is skipped for them.
+        match early_facts {
+            // Fact-augmented path: facts were already distilled in step 2b.
+            Some(facts) => {
+                if !facts.is_empty() {
+                    if let Err(e) = self.index_memories(&cfg, doc, &doc_id, facts).await {
+                        eprintln!("[recally] memory indexing failed for '{}': {e}", doc.title);
+                    }
                 }
             }
-            Ok(_) => {}
-            Err(e) => eprintln!("[recally] distill failed for '{}': {e}", doc.title),
+            // Default path: distill AFTER upsert (chunks already searchable).
+            None => {
+                if !do_distill {
+                    return Ok(doc_id);
+                }
+                match distill::distill_facts(
+                    self.llm.as_ref(),
+                    &cfg.distill_model,
+                    &doc.title,
+                    &content,
+                    &date_str(doc.captured_at),
+                )
+                .await
+                {
+                    Ok(facts) if !facts.is_empty() => {
+                        if let Err(e) = self.index_memories(&cfg, doc, &doc_id, facts).await {
+                            eprintln!("[recally] memory indexing failed for '{}': {e}", doc.title);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[recally] distill failed for '{}': {e}", doc.title),
+                }
+            }
         }
 
         Ok(doc_id)
@@ -1188,6 +1255,7 @@ impl MemoryEngine {
             &cfg.distill_model,
             &doc.title,
             &doc.content,
+            &date_str(doc.captured_at),
         )
         .await?;
         let n = facts.len();
@@ -1295,6 +1363,14 @@ fn build_filter(plan: &rewrite::SearchPlan) -> Option<Value> {
     } else {
         Some(json!({ "must": must }))
     }
+}
+
+/// Format a unix timestamp as `YYYY-MM-DD` (UTC). Used to anchor relative-date
+/// resolution during distillation (T2.1 event-time extraction).
+fn date_str(unix: i64) -> String {
+    chrono::DateTime::from_timestamp(unix, 0)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
 }
 
 /// Embedding input for a chunk: readable title + optional doc-context blurb +

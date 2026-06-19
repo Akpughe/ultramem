@@ -48,7 +48,10 @@ meetings/calls/standups → meeting). Otherwise null.\n\
 references, INCLUSIVE on both ends. A single day means after and before are that same date \
 (\"yesterday\" → both set to {}). \"this past week\" → after = 7 days ago, before = {}. \
 Both null when no time window is mentioned.\n\
-- list: true when the user asks to list/enumerate many items.",
+- list: true when answering needs MANY memories, not one — i.e. the user asks to \
+list/enumerate items, OR asks a counting/aggregation question (\"how many…\", \"how much…\", \
+\"how often…\", \"total number of…\", \"how many times…\"). These need every relevant memory \
+retrieved, not just the closest one, so set list=true.",
         now.format("%A, %B %e, %Y"),
         (now - chrono::Duration::days(1)).format("%B %e, %Y"),
         (now - chrono::Duration::days(1)).format("%Y-%m-%d"),

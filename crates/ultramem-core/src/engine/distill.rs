@@ -27,15 +27,20 @@ stand alone without any surrounding context, e.g. \"The Q3 roadmap prioritizes t
 redesign\". Extract as many facts as the content genuinely supports — dense content may yield \
 many, and boilerplate, navigation text, or generic content with nothing personal or \
 project-specific yields none. When nothing is worth remembering, return []. \
-If (and only if) a fact stops being true after a specific calendar date — a deadline, an \
-appointment, a 'tomorrow'/'next week' item — append \" [until YYYY-MM-DD]\" to that fact string \
-using the absolute date. Do not add it to durable facts. \
+When a fact describes something that happened (or is scheduled) on a specific date — stated \
+explicitly OR relatively ('yesterday', 'last Sunday', 'two weeks ago', 'next Friday') — resolve \
+it against the Conversation date given below and PREFIX that fact with the absolute event date as \
+\"[on YYYY-MM-DD] \" (e.g. \"[on 2023-05-20] The user visited the Museum of Modern Art\"). This \
+anchors temporal reasoning; use it whenever a fact has a 'when'. \
+Separately, if (and only if) a fact stops being true after a specific calendar date — a deadline, \
+an appointment, a 'tomorrow'/'next week' item — append \" [until YYYY-MM-DD]\" to that fact string. \
 Respond with ONLY a JSON array of strings.";
 
 const MERGE_SYSTEM: &str = "You are given candidate facts extracted from different parts of the \
 same document. Merge near-duplicates into a single best phrasing, drop generic or boilerplate \
 facts, and keep every genuinely distinct fact — do not summarize distinct facts away. \
-Preserve any trailing \" [until YYYY-MM-DD]\" expiry suffix on the facts that have one. \
+Preserve any leading \"[on YYYY-MM-DD] \" event-date prefix and any trailing \" [until YYYY-MM-DD]\" \
+expiry suffix on the facts that have one. \
 Respond with ONLY a JSON array of strings.";
 
 /// Extract memories from a whole document. Segment → extract per segment →
@@ -46,6 +51,7 @@ pub async fn distill_facts(
     model: &ResolvedModel,
     title: &str,
     content: &str,
+    doc_date: &str,
 ) -> Result<Vec<String>, String> {
     if !model.is_ready() {
         return Err("no model configured for distillation".into());
@@ -55,10 +61,19 @@ pub async fn distill_facts(
         return Ok(vec![]);
     }
 
+    // The conversation date anchors relative-date resolution ("last Sunday").
+    let date_line = if doc_date.is_empty() {
+        String::new()
+    } else {
+        format!("Conversation date: {doc_date}\n")
+    };
     let mut all: Vec<String> = Vec::new();
     let total = segments.len();
     for (i, seg) in segments.iter().enumerate() {
-        let user = format!("Title: {title}\nPart {} of {total}\n\n{seg}", i + 1);
+        let user = format!(
+            "{date_line}Title: {title}\nPart {} of {total}\n\n{seg}",
+            i + 1
+        );
         match llm.chat(model, EXTRACT_SYSTEM, &user, 0.3).await {
             Ok(raw) => match parse_facts(&raw, MAX_FACTS_PER_SEGMENT) {
                 Some(facts) => all.extend(facts),
@@ -110,22 +125,63 @@ pub async fn distill_facts(
     }
 }
 
-/// Dig a JSON string array out of model output that may be wrapped in prose
-/// or code fences.
+/// Dig the facts out of model output. Robust to format drift across providers:
+/// accepts a JSON array of strings OR of objects (e.g. `[{"fact": "..."}]`), and
+/// if the JSON is malformed, falls back to harvesting quoted strings — so a
+/// stray format never silently drops an entire segment's facts.
 pub fn parse_facts(raw: &str, cap: usize) -> Option<Vec<String>> {
-    let start = raw.find('[')?;
-    let end = raw.rfind(']')?;
-    if end < start {
-        return None;
-    }
-    let arr: Vec<String> = serde_json::from_str(&raw[start..=end]).ok()?;
-    Some(
-        arr.into_iter()
-            .map(|f| f.trim().to_string())
+    let finalize = |v: Vec<String>| -> Vec<String> {
+        v.into_iter()
+            .map(|f| f.trim().trim_matches('"').trim().to_string())
             .filter(|f| f.len() >= 8)
             .take(cap)
-            .collect(),
-    )
+            .collect()
+    };
+
+    // 1. Proper JSON array span — parse as generic values so an array of strings
+    //    OR of objects both work. A valid-but-empty array means "nothing
+    //    memorable" (Some(empty)), distinct from unparseable output (None).
+    if let (Some(start), Some(end)) = (raw.find('['), raw.rfind(']')) {
+        if end > start {
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&raw[start..=end]) {
+                let facts: Vec<String> = arr
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        serde_json::Value::String(s) => Some(s),
+                        // {"fact": "..."} / {"text": "..."} / first string field.
+                        serde_json::Value::Object(o) => o
+                            .get("fact")
+                            .or_else(|| o.get("text"))
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string)
+                            .or_else(|| o.values().find_map(|x| x.as_str().map(str::to_string))),
+                        _ => None,
+                    })
+                    .collect();
+                return Some(finalize(facts));
+            }
+        }
+    }
+
+    // 2. Fallback: harvest quoted strings from malformed/partial JSON (e.g. an
+    //    unterminated array, or trailing commas the parser rejects). Only counts
+    //    as a parse if it actually yields facts — otherwise None (unparseable).
+    let mut harvested = Vec::new();
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            let mut s = String::new();
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
+            harvested.push(s);
+        }
+    }
+    let out = finalize(harvested);
+    (!out.is_empty()).then_some(out)
 }
 
 /// Case-insensitive exact dedup, preserving first occurrence order.
@@ -178,6 +234,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_array_of_objects() {
+        // Format drift: some models return objects, not bare strings.
+        let raw =
+            r#"[{"fact": "User builds a Tauri app daily"}, {"text": "Deadline is June 20th"}]"#;
+        let facts = parse_facts(raw, 10).unwrap();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0], "User builds a Tauri app daily");
+    }
+
+    #[test]
+    fn harvests_from_malformed_json() {
+        // Unterminated array (cut off / trailing comma) — fall back to quoted strings.
+        let raw = r#"["User prefers Rust over Go", "User lives in Cape Town","#;
+        let facts = parse_facts(raw, 10).unwrap();
+        assert_eq!(facts.len(), 2);
+    }
+
+    #[test]
     fn local_dedup_is_case_insensitive_and_ordered() {
         let facts = vec![
             "The launch is June 20".to_string(),
@@ -220,7 +294,7 @@ mod live_tests {
             );
             let llm = crate::llm::LlmClient::new();
             let model = crate::llm::ResolvedModel::groq(&key, "openai/gpt-oss-120b");
-            let facts = distill_facts(&llm, &model, "Team meeting notes", &content)
+            let facts = distill_facts(&llm, &model, "Team meeting notes", &content, "2024-01-15")
                 .await
                 .expect("distill_facts");
             eprintln!("extracted {} facts: {facts:#?}", facts.len());
