@@ -30,3 +30,7 @@ path = "examples/probe.rs"
 [[example]]
 name = "bench_ingest"
 path = "examples/bench_ingest.rs"
+
+[[example]]
+name = "longmemeval"
+path = "examples/longmemeval.rs"
