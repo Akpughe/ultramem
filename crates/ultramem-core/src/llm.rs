@@ -7,8 +7,22 @@
 
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const GROQ_BASE: &str = "https://api.groq.com/openai/v1";
+pub const GEMINI_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
+
+// Process-wide LLM token accounting (every `complete` call adds its usage here),
+// so a harness can report measured tokens/cost across the engine + its own calls.
+static PROMPT_TOKENS: AtomicU64 = AtomicU64::new(0);
+static COMPLETION_TOKENS: AtomicU64 = AtomicU64::new(0);
+
+/// (prompt_tokens, completion_tokens, total) accumulated since process start.
+pub fn token_usage() -> (u64, u64, u64) {
+    let p = PROMPT_TOKENS.load(Ordering::Relaxed);
+    let c = COMPLETION_TOKENS.load(Ordering::Relaxed);
+    (p, c, p + c)
+}
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -19,6 +33,10 @@ pub enum ProviderKind {
     OpenaiCompat,
     /// Anthropic Messages API.
     Anthropic,
+    /// Google Gemini native API (`x-goog-api-key` auth, `contents`/`parts` shape).
+    /// The OpenAI-compat layer rejects the newer `AQ.`-format keys, so we speak
+    /// the native protocol.
+    Gemini,
 }
 
 /// A fully-resolved model call target.
@@ -28,6 +46,11 @@ pub struct ResolvedModel {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Gemini "thinking" budget: `None` = provider default, `Some(0)` = off,
+    /// `Some(-1)` = dynamic (model decides), `Some(n)` = fixed token budget.
+    /// Ignored by non-Gemini providers. Thinking tokens are billed, so turn it
+    /// off for mechanical work (distillation) and on for reasoning answers.
+    pub thinking_budget: Option<i32>,
 }
 
 impl ResolvedModel {
@@ -37,7 +60,26 @@ impl ResolvedModel {
             base_url: GROQ_BASE.into(),
             api_key: api_key.into(),
             model: model.into(),
+            thinking_budget: None,
         }
+    }
+
+    /// Google Gemini native API (e.g. model `gemini-2.5-flash`).
+    pub fn gemini(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            kind: ProviderKind::Gemini,
+            base_url: GEMINI_BASE.into(),
+            api_key: api_key.into(),
+            model: model.into(),
+            thinking_budget: None,
+        }
+    }
+
+    /// Set the Gemini thinking budget (`0` off, `-1` dynamic, `n` fixed). No-op
+    /// for other providers.
+    pub fn with_thinking(mut self, budget: i32) -> Self {
+        self.thinking_budget = Some(budget);
+        self
     }
 
     /// Local providers (Ollama) need no key; everyone else does.
@@ -114,7 +156,32 @@ impl LlmClient {
     }
 
     /// Non-streaming completion from OpenAI-shaped messages (system first).
+    /// Completion with retry: transient failures (network/timeout/429/5xx) are
+    /// retried with exponential backoff. Hosted LLM/embedding APIs blip under
+    /// load, and a dropped call silently loses a memory at ingest time.
     pub async fn complete(
+        &self,
+        m: &ResolvedModel,
+        messages: Value,
+        temperature: f64,
+    ) -> Result<String, String> {
+        let mut delay_ms = 400u64;
+        let mut last = String::new();
+        for attempt in 0..4 {
+            match self.complete_once(m, messages.clone(), temperature).await {
+                Ok(v) => return Ok(v),
+                Err(e) if is_transient(&e) && attempt < 3 => {
+                    last = e;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    delay_ms *= 2;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
+    }
+
+    async fn complete_once(
         &self,
         m: &ResolvedModel,
         messages: Value,
@@ -138,6 +205,10 @@ impl LlmClient {
                         v["error"]["message"].as_str().unwrap_or("unknown")
                     ));
                 }
+                record_usage(
+                    v["usage"]["prompt_tokens"].as_u64(),
+                    v["usage"]["completion_tokens"].as_u64(),
+                );
                 Ok(v["choices"][0]["message"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -168,12 +239,72 @@ impl LlmClient {
                         v["error"]["message"].as_str().unwrap_or("unknown")
                     ));
                 }
+                record_usage(
+                    v["usage"]["input_tokens"].as_u64(),
+                    v["usage"]["output_tokens"].as_u64(),
+                );
                 Ok(v["content"]
                     .as_array()
                     .map(|blocks| {
                         blocks
                             .iter()
                             .filter_map(|b| b["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .unwrap_or_default())
+            }
+            ProviderKind::Gemini => {
+                // Native Gemini: x-goog-api-key auth, contents/parts shape.
+                let (system, msgs) = split_system(&messages);
+                let contents: Vec<Value> = msgs
+                    .iter()
+                    .map(|msg| {
+                        let role = if msg["role"].as_str() == Some("assistant") { "model" } else { "user" };
+                        json!({"role": role, "parts": [{"text": msg["content"].as_str().unwrap_or_default()}]})
+                    })
+                    .collect();
+                let mut body = json!({
+                    "contents": contents,
+                    "generationConfig": {"temperature": temperature},
+                });
+                if let Some(budget) = m.thinking_budget {
+                    body["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget": budget});
+                }
+                if !system.is_empty() {
+                    body["systemInstruction"] = json!({"parts": [{"text": system}]});
+                }
+                let resp = self
+                    .http
+                    .post(format!(
+                        "{}/models/{}:generateContent",
+                        m.base_url.trim_end_matches('/'),
+                        m.model
+                    ))
+                    .header("x-goog-api-key", &m.api_key)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| format!("gemini unreachable: {e}"))?;
+                let status = resp.status();
+                let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+                if !status.is_success() {
+                    return Err(format!(
+                        "gemini error {status}: {}",
+                        v["error"]["message"].as_str().unwrap_or("unknown")
+                    ));
+                }
+                // `total - prompt` captures visible output PLUS billed "thinking"
+                // tokens (which candidatesTokenCount alone omits).
+                let prompt = v["usageMetadata"]["promptTokenCount"].as_u64();
+                let total = v["usageMetadata"]["totalTokenCount"].as_u64();
+                record_usage(prompt, total.zip(prompt).map(|(t, p)| t.saturating_sub(p)));
+                Ok(v["candidates"][0]["content"]["parts"]
+                    .as_array()
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|p| p["text"].as_str())
                             .collect::<Vec<_>>()
                             .join("")
                     })
@@ -267,6 +398,12 @@ impl LlmClient {
             ProviderKind::Anthropic => {
                 self.stream_anthropic(m, messages, temperature, on_token)
                     .await
+            }
+            ProviderKind::Gemini => {
+                // Native Gemini streaming differs; fall back to one non-streamed call.
+                let text = self.complete(m, messages, temperature).await?;
+                on_token(&text);
+                Ok(text)
             }
         }
     }
@@ -485,6 +622,33 @@ impl LlmClient {
     }
 }
 
+/// Add one call's token usage to the process-wide counters (best-effort —
+/// providers that omit usage just contribute nothing).
+fn record_usage(prompt: Option<u64>, completion: Option<u64>) {
+    if let Some(p) = prompt {
+        PROMPT_TOKENS.fetch_add(p, Ordering::Relaxed);
+    }
+    if let Some(c) = completion {
+        COMPLETION_TOKENS.fetch_add(c, Ordering::Relaxed);
+    }
+}
+
+/// Whether an error string looks like a transient failure worth retrying
+/// (network/timeout/rate-limit/5xx) rather than a permanent one (4xx, parse).
+pub(crate) fn is_transient(e: &str) -> bool {
+    let e = e.to_lowercase();
+    e.contains("unreachable")
+        || e.contains("error sending request")
+        || e.contains("timed out")
+        || e.contains("timeout")
+        || e.contains("connection")
+        || e.contains(" 429")
+        || e.contains(" 500")
+        || e.contains(" 502")
+        || e.contains(" 503")
+        || e.contains(" 504")
+}
+
 /// Pull system messages out of an OpenAI-shaped array into Anthropic's
 /// top-level `system` string, leaving user/assistant turns as the message list.
 fn split_system(messages: &Value) -> (String, Vec<Value>) {
@@ -535,6 +699,7 @@ mod tests {
             base_url: "http://localhost:11434/v1".into(),
             api_key: String::new(),
             model: "llama3.1".into(),
+            thinking_budget: None,
         };
         assert!(ollama.is_ready(), "local endpoints need no key");
     }

@@ -72,53 +72,84 @@ pub async fn embed(
     }
     let mut out: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
     for batch in inputs.chunks(BATCH) {
-        let resp = http
-            .post(URL)
-            .bearer_auth(api_key)
-            .timeout(std::time::Duration::from_secs(60))
-            .json(&json!({ "model": MODEL, "task": task, "input": batch }))
-            .send()
-            .await
-            .map_err(|e| format!("jina unreachable: {e}"))?;
-        let status = resp.status();
-        let v: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("jina bad response: {e}"))?;
-        if !status.is_success() {
-            let detail = v["detail"]
-                .as_str()
-                .or_else(|| v["error"]["message"].as_str())
-                .unwrap_or("unknown");
-            return Err(format!("jina error {status}: {detail}"));
-        }
-        let mut data: Vec<&Value> = v["data"]
-            .as_array()
-            .map(|a| a.iter().collect())
-            .unwrap_or_default();
-        if data.len() != batch.len() {
-            return Err(format!(
-                "jina returned {} embeddings for {} inputs",
-                data.len(),
-                batch.len()
-            ));
-        }
-        // The API documents index-ordered results; sort defensively.
-        data.sort_by_key(|d| d["index"].as_u64().unwrap_or(0));
-        for d in data {
-            let vec: Vec<f32> = d["embedding"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_f64().map(|f| f as f32))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if vec.len() != DIM {
-                return Err(format!("jina embedding dim {} != {DIM}", vec.len()));
+        // Retry transient failures (network/timeout/429/5xx) with backoff — a
+        // dropped embed silently loses a memory at ingest time.
+        let mut delay_ms = 400u64;
+        let mut last = String::new();
+        let mut got = None;
+        for attempt in 0..4 {
+            match embed_batch(http, api_key, task, batch).await {
+                Ok(v) => {
+                    got = Some(v);
+                    break;
+                }
+                Err(e) if crate::llm::is_transient(&e) && attempt < 3 => {
+                    last = e;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    delay_ms *= 2;
+                }
+                Err(e) => return Err(e),
             }
-            out.push(vec);
         }
+        out.extend(got.ok_or(last)?);
+    }
+    Ok(out)
+}
+
+/// One embedding request for a single batch.
+async fn embed_batch(
+    http: &reqwest::Client,
+    api_key: &str,
+    task: &str,
+    batch: &[String],
+) -> Result<Vec<Vec<f32>>, String> {
+    let resp = http
+        .post(URL)
+        .bearer_auth(api_key)
+        .timeout(std::time::Duration::from_secs(60))
+        .json(&json!({ "model": MODEL, "task": task, "input": batch }))
+        .send()
+        .await
+        .map_err(|e| format!("jina unreachable: {e}"))?;
+    let status = resp.status();
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("jina bad response: {e}"))?;
+    if !status.is_success() {
+        let detail = v["detail"]
+            .as_str()
+            .or_else(|| v["error"]["message"].as_str())
+            .unwrap_or("unknown");
+        return Err(format!("jina error {status}: {detail}"));
+    }
+    let mut data: Vec<&Value> = v["data"]
+        .as_array()
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    if data.len() != batch.len() {
+        return Err(format!(
+            "jina returned {} embeddings for {} inputs",
+            data.len(),
+            batch.len()
+        ));
+    }
+    // The API documents index-ordered results; sort defensively.
+    data.sort_by_key(|d| d["index"].as_u64().unwrap_or(0));
+    let mut out = Vec::with_capacity(batch.len());
+    for d in data {
+        let vec: Vec<f32> = d["embedding"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_f64().map(|f| f as f32))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if vec.len() != DIM {
+            return Err(format!("jina embedding dim {} != {DIM}", vec.len()));
+        }
+        out.push(vec);
     }
     Ok(out)
 }
