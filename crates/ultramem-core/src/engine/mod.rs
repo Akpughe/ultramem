@@ -11,6 +11,7 @@ pub mod chunker;
 pub mod context;
 pub mod distill;
 pub mod extract;
+pub mod graph;
 pub mod jina;
 pub mod memory;
 pub mod mistral;
@@ -65,6 +66,9 @@ pub struct EngineCfg {
     pub openai_embed_dim: usize,
     pub chunks_collection: String,
     pub facts_collection: String,
+    /// Tier-3 bi-temporal knowledge-graph collection (entity-attribute edges
+    /// with event time). Only used when `temporal_graph` is on.
+    pub graph_collection: String,
     /// Resolved model for retrieval planning (the Plan role).
     pub plan_model: ResolvedModel,
     /// Resolved model for fact distillation (the Distill role).
@@ -104,6 +108,12 @@ pub struct EngineCfg {
     /// indexing URL metadata only. OFF by default: it sends every visited URL
     /// to a third party and fetches its content — a deliberate privacy choice.
     pub fetch_web_bodies: bool,
+    /// Tier-3: extract bi-temporal entity-attribute edges at ingest and resolve
+    /// them at answer time (see `graph.rs`). Additive and non-fatal; OFF by
+    /// default (adds one extraction LLM pass per document and a graph
+    /// collection). Turns knowledge-update's "use the latest value" from an LLM
+    /// guess into a deterministic event-time query.
+    pub temporal_graph: bool,
 }
 
 impl Default for EngineCfg {
@@ -120,6 +130,7 @@ impl Default for EngineCfg {
             openai_embed_dim: 1536,
             chunks_collection: "ultramem_chunks".into(),
             facts_collection: "ultramem_facts".into(),
+            graph_collection: "ultramem_graph".into(),
             plan_model: ResolvedModel::groq(String::new(), "llama-3.3-70b-versatile"),
             distill_model: ResolvedModel::groq(String::new(), "openai/gpt-oss-120b"),
             // Contextual Retrieval is OFF by default: A/B on real docs showed
@@ -133,6 +144,7 @@ impl Default for EngineCfg {
             hybrid_search: false,
             multi_query: true,
             fetch_web_bodies: false,
+            temporal_graph: false,
         }
     }
 }
@@ -175,6 +187,14 @@ impl EngineCfg {
                 let c = var("ULTRAMEM_FACTS_COLLECTION");
                 if c.is_empty() {
                     "ultramem_facts".into()
+                } else {
+                    c
+                }
+            },
+            graph_collection: {
+                let c = var("ULTRAMEM_GRAPH_COLLECTION");
+                if c.is_empty() {
+                    "ultramem_graph".into()
                 } else {
                     c
                 }
@@ -373,6 +393,26 @@ impl MemoryEngine {
         self.store
             .ensure_payload_index(&cfg.facts_collection, "valid_until", "integer")
             .await;
+        // Tier-3 bi-temporal knowledge graph: a dense collection of edges, keyed
+        // by subject/predicate for grouping and valid_from for event-time order.
+        if cfg.temporal_graph {
+            self.store
+                .ensure_collection(&cfg.graph_collection, self.embedder.dim())
+                .await?;
+            for (field, kind) in [
+                ("subject", "keyword"),
+                ("predicate", "keyword"),
+                ("is_latest", "bool"),
+                ("valid_from", "integer"),
+                ("valid_to", "integer"),
+                ("captured_at", "integer"),
+                ("container_tag", "keyword"),
+            ] {
+                self.store
+                    .ensure_payload_index(&cfg.graph_collection, field, kind)
+                    .await;
+            }
+        }
         Ok(())
     }
 
@@ -587,7 +627,53 @@ impl MemoryEngine {
             }
         }
 
+        // 6. Tier-3: extract bi-temporal edges into the knowledge graph. Additive
+        // and non-fatal — failures never block the (already-searchable) chunks.
+        if cfg.temporal_graph && do_distill {
+            match graph::extract_edges(
+                self.llm.as_ref(),
+                &cfg.distill_model,
+                &doc.title,
+                &content,
+                &date_str(doc.captured_at),
+            )
+            .await
+            {
+                Ok(edges) if !edges.is_empty() => {
+                    if let Err(e) = self.index_edges(&cfg, doc, &doc_id, edges).await {
+                        eprintln!("[recally] edge indexing failed for '{}': {e}", doc.title);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[recally] edge extraction failed for '{}': {e}", doc.title),
+            }
+        }
+
         Ok(doc_id)
+    }
+
+    /// Graph-only ingest: extract and store bi-temporal edges for a document
+    /// WITHOUT touching chunks or distilled facts. Augments an existing
+    /// chunk/fact index with the knowledge graph in a fast backfill pass, and
+    /// keeps an A/B clean — retrieval is unchanged, only the graph is added.
+    pub async fn add_document_graph_only(&self, doc: &IngestDoc) -> Result<(), String> {
+        let cfg = self.cfg();
+        if !cfg.temporal_graph || doc.content.chars().count() < 280 {
+            return Ok(());
+        }
+        let doc_id = uuid::Uuid::new_v4().to_string();
+        let edges = graph::extract_edges(
+            self.llm.as_ref(),
+            &cfg.distill_model,
+            &doc.title,
+            &doc.content,
+            &date_str(doc.captured_at),
+        )
+        .await?;
+        if !edges.is_empty() {
+            self.index_edges(&cfg, doc, &doc_id, edges).await?;
+        }
+        Ok(())
     }
 
     /// Ingest a web page: fetch + clean it via Jina Reader, then run the normal
@@ -753,6 +839,165 @@ impl MemoryEngine {
             }
         }
         Ok(())
+    }
+
+    /// Index a document's extracted edges into the bi-temporal knowledge graph,
+    /// applying deterministic event-time supersession (`graph::supersession`).
+    /// Non-fatal: a failure here never blocks the already-searchable chunks.
+    async fn index_edges(
+        &self,
+        cfg: &EngineCfg,
+        doc: &IngestDoc,
+        doc_id: &str,
+        edges: Vec<graph::Edge>,
+    ) -> Result<(), String> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        // A readable statement per edge — embedded for answer-time lookup.
+        let statements: Vec<String> = edges.iter().map(edge_statement).collect();
+        let vecs = self.embedder.embed(EmbedTask::Passage, &statements).await?;
+
+        // Existing latest edges in this namespace, grouped by (subject,
+        // predicate), for cross-session supersession.
+        let mut by_group: std::collections::HashMap<(String, String), Vec<graph::StoredEdge>> =
+            std::collections::HashMap::new();
+        for se in self.latest_edges(cfg, doc.tag()).await {
+            by_group
+                .entry((se.edge.subject.clone(), se.edge.predicate.clone()))
+                .or_default()
+                .push(se);
+        }
+
+        let mut points: Vec<Value> = Vec::new();
+        let mut superseded: Vec<String> = Vec::new();
+        for ((edge, vec), statement) in edges.iter().zip(vecs.iter()).zip(statements.iter()) {
+            let empty: &[graph::StoredEdge] = &[];
+            let group = by_group
+                .get(&(edge.subject.clone(), edge.predicate.clone()))
+                .map(|v| v.as_slice())
+                .unwrap_or(empty);
+            let (sup, is_latest) = graph::supersession(edge, group);
+            superseded.extend(sup);
+            points.push(json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "vector": vec,
+                "payload": {
+                    "kind": "edge",
+                    "subject": edge.subject,
+                    "predicate": edge.predicate,
+                    "object": edge.object,
+                    "valid_from": edge.valid_from,
+                    "valid_to": edge.valid_to,
+                    "singular": edge.singular,
+                    "is_latest": is_latest,
+                    "captured_at": doc.captured_at,
+                    "doc_id": doc_id,
+                    "statement": statement,
+                    "container_tag": doc.tag(),
+                },
+            }));
+        }
+        self.store.upsert(&cfg.graph_collection, points).await?;
+        if !superseded.is_empty() {
+            superseded.sort();
+            superseded.dedup();
+            if let Err(e) = self
+                .store
+                .set_payload(&cfg.graph_collection, &superseded, json!({ "is_latest": false }))
+                .await
+            {
+                eprintln!(
+                    "[recally] failed to flag {} superseded edges: {e}",
+                    superseded.len()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Scroll the latest edges in a namespace and parse them into StoredEdges.
+    async fn latest_edges(&self, cfg: &EngineCfg, tag: &str) -> Vec<graph::StoredEdge> {
+        let filter = tagged_filter(
+            Some(json!({ "must_not": [ { "key": "is_latest", "match": { "value": false } } ] })),
+            tag,
+        );
+        self.store
+            .scroll_all(&cfg.graph_collection, Some(filter), 2000)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(stored_edge_from_payload)
+            .collect()
+    }
+
+    /// Answer-time temporal resolution: semantic-search the edge groups relevant
+    /// to `query`, build their full dated timelines, and render a context block
+    /// with the value valid at `as_of` marked. Empty when the graph is off or
+    /// nothing relevant is found. This is what turns "use the latest value" into
+    /// a deterministic event-time lookup instead of an LLM guess.
+    pub async fn resolve_edges_tagged(
+        &self,
+        tag: &str,
+        query: &str,
+        as_of: i64,
+        limit: usize,
+    ) -> String {
+        let cfg = self.cfg();
+        if !cfg.temporal_graph {
+            return String::new();
+        }
+        let qv = match self
+            .embedder
+            .embed(EmbedTask::Query, &[query.to_string()])
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => return String::new(),
+        };
+        let Some(qvec) = qv.first() else {
+            return String::new();
+        };
+        let hits = self
+            .store
+            .search(
+                &cfg.graph_collection,
+                qvec,
+                limit,
+                0.25,
+                Some(tagged_filter(None, tag)),
+            )
+            .await
+            .unwrap_or_default();
+        if hits.is_empty() {
+            return String::new();
+        }
+        // The relevant attribute groups (subject, predicate).
+        let relevant: std::collections::HashSet<(String, String)> = hits
+            .iter()
+            .filter_map(|h| {
+                let p = &h["payload"];
+                Some((
+                    p["subject"].as_str()?.to_string(),
+                    p["predicate"].as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        // Pull every edge (latest or historical) in those groups for the full
+        // timeline, then resolve as of the query timepoint.
+        let edges: Vec<graph::StoredEdge> = self
+            .store
+            .scroll_all(&cfg.graph_collection, Some(tagged_filter(None, tag)), 4000)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(stored_edge_from_payload)
+            .filter(|se| relevant.contains(&(se.edge.subject.clone(), se.edge.predicate.clone())))
+            .collect();
+        if edges.is_empty() {
+            return String::new();
+        }
+        graph::render_block(&graph::resolve(&edges, as_of))
     }
 
     /// Ask-time retrieval. A fast planning pass first resolves relative dates,
@@ -1371,6 +1616,40 @@ fn date_str(unix: i64) -> String {
     chrono::DateTime::from_timestamp(unix, 0)
         .map(|d| d.format("%Y-%m-%d").to_string())
         .unwrap_or_default()
+}
+
+/// A readable one-line statement for a knowledge-graph edge — embedded for
+/// answer-time semantic lookup and shown in the resolved block.
+fn edge_statement(e: &graph::Edge) -> String {
+    format!(
+        "{} {}: {} ({})",
+        e.subject,
+        e.predicate.replace('_', " "),
+        e.object,
+        date_str(e.valid_from)
+    )
+}
+
+/// Parse a Qdrant edge point back into a `StoredEdge` for resolution.
+fn stored_edge_from_payload(p: &Value) -> Option<graph::StoredEdge> {
+    let pl = &p["payload"];
+    let id = p["id"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| p["id"].to_string());
+    Some(graph::StoredEdge {
+        id,
+        edge: graph::Edge {
+            subject: pl["subject"].as_str()?.to_string(),
+            predicate: pl["predicate"].as_str()?.to_string(),
+            object: pl["object"].as_str()?.to_string(),
+            valid_from: pl["valid_from"].as_i64().unwrap_or(0),
+            valid_to: pl["valid_to"].as_i64(),
+            singular: pl["singular"].as_bool().unwrap_or(true),
+        },
+        captured_at: pl["captured_at"].as_i64().unwrap_or(0),
+        is_latest: pl["is_latest"].as_bool().unwrap_or(true),
+    })
 }
 
 /// Embedding input for a chunk: readable title + optional doc-context blurb +
