@@ -1,6 +1,6 @@
 # How UltraMem Gets to Near‑Perfect on LongMemEval‑S
 
-> Engineering analysis + implementation plan. **Status (2026‑06‑20):** trustworthy **120‑question** baseline **63.3%**, lifted to **66.7%** by a type‑aware answer‑prompt pass. **Retrieval is essentially solved (97.5% gold retrieved); the bottleneck is now answer *synthesis* (42 of 44 failures).** **Tier‑3 — the bi‑temporal knowledge graph — is now built, unit‑tested, and smoke‑validated** (it fixes the exact knowledge‑update cases prompting could not); a full 120‑question measurement is running. This document explains *why*, what the SOTA does, the loopholes, and the tiered plan.
+> Engineering analysis + implementation plan. **Status (2026‑06‑20):** trustworthy **120‑question** trajectory **63.3% → 66.7% (prompt pass) → 72.5% (Tier‑3 temporal knowledge graph)**, Gemini 2.5 Flash judge. **Retrieval is essentially solved (~97% gold); the gains are now in synthesis.** **Tier‑3 — the bi‑temporal knowledge graph — is built, tested, and measured: it lifted knowledge‑update 60% → 80%** (the dated‑value cases prompting could not fix) as a clean A/B (graph‑only backfill over identical retrieval). This document explains *why*, what the SOTA does, the loopholes, and the tiered plan.
 
 ---
 
@@ -141,7 +141,7 @@ Each item: **rationale (with measured gain) · code changes · effort · risk ·
 
 - **Effort:** XL (weeks; a real subsystem) · **Risk:** high · **Lift:** the path to ~90%. **This is a deliberate architectural bet — decide separately after Tier 1–2 plateau.**
 
-> **STATUS (2026‑06‑20): BUILT + smoke‑validated.** Implemented in `engine/graph.rs` as flat first‑class edge records (not nested payloads — Qdrant nested‑array temporal filtering is unreliable) on a dense `graph_collection`, with deterministic Rust supersession and an answer‑time `resolve_edges_tagged`. The `singular` state/event flag handles both "current value" (supersede) and "most recent" (max `valid_from`). It already fixes the knowledge‑update case prompting could not (the 5K personal best). 120‑Q measurement in progress — see the run‑history appendix.
+> **STATUS (2026‑06‑20): BUILT + smoke‑validated.** Implemented in `engine/graph.rs` as flat first‑class edge records (not nested payloads — Qdrant nested‑array temporal filtering is unreliable) on a dense `graph_collection`, with deterministic Rust supersession and an answer‑time `resolve_edges_tagged`. The `singular` state/event flag handles both "current value" (supersede) and "most recent" (max `valid_from`). **Measured (120‑Q): knowledge‑update 60% → 80%, overall 66.7% → 72.5%** as a clean A/B (graph‑only backfill, identical retrieval) — see the run‑history appendix.
 
 ---
 
@@ -259,4 +259,18 @@ The type‑aware answer‑prompt pass (prompt‑only, no re‑ingest) gave **+4 
 
 **Smoke validation on real conversations:** the graph extracted `personal_best_5k_time: 27:12 (superseded) → 25:50 (LATEST)` and the answer model used it — *"latest is 25:50… earlier was 27:12 but it has been superseded."* **That exact knowledge‑update question was wrong in both prior runs.** Both smoke KU questions passed 2/2.
 
-Engineering note: rather than a 7–9h full re‑ingest, a **graph‑only backfill** (`add_document_graph_only` + `ULTRAMEM_LME_GRAPH_ONLY`) builds *only* the edges over the existing `lme120` chunk/fact index — ~2.6× cheaper (~160k vs ~425k tokens/question) and a clean A/B (retrieval byte‑identical to the 66.7% baseline; the only changed variable is the graph). The 120‑question backfill into `ultramem_lme120_graph` is in progress; the eval and per‑category before/after will land here next.
+Engineering note: rather than a 7–9h full re‑ingest, a **graph‑only backfill** (`add_document_graph_only` + `ULTRAMEM_LME_GRAPH_ONLY`) builds *only* the edges over the existing `lme120` chunk/fact index — ~2.6× cheaper (~160k vs ~425k tokens/question) and a clean A/B (retrieval byte‑identical to the 66.7% baseline; the only changed variable is the graph). 33,734 edges across the 120 namespaces.
+
+**Result (120‑Q, 20/category, Gemini 2.5 Flash judge) — the graph is a clean win:**
+
+| Category | 63.3 base | 66.7 prompt | **72.5 +GRAPH** | Δ graph |
+|---|---|---|---|---|
+| single‑session‑user | 85 | 80 | **90** | +2 |
+| single‑session‑assistant | 70 | 65 | **70** | +1 |
+| single‑session‑preference | 30 | 45 | **45** | +0 |
+| **knowledge‑update** | 60 | 60 | **80** | **+4 ▲** |
+| temporal‑reasoning | 75 | 80 | **85** | +1 |
+| multi‑session | 60 | 70 | **65** | −1 (noise) |
+| **OVERALL** | **63.3** | **66.7** | **72.5** (87/120) | **+6** |
+
+**Knowledge‑update 60% → 80% is the headline** — the four flips (5K personal best, yoga frequency, cocktail‑class day, therapist frequency) are exactly the *dated‑value resolution* cases prompting could not move: the graph surfaces the resolved current value with its event date, so the model stops abstaining or picking the stale value. Because the backfill changed *only* the graph (retrieval identical to the 66.7% run), this delta is attributable to Tier‑3. The single‑session/temporal +1/+2 are part graph, part run‑to‑run noise (±2–4); multi‑session −1 is noise; preference is untouched by the graph. **Next lever: extend from entity‑attribute edges to multi‑hop relationship traversal** (temporal/multi‑session) — the fuller Zep recipe.
