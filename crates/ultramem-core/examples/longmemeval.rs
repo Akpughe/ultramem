@@ -80,6 +80,10 @@ async fn main() {
     // T1.2: enrich each chunk's embedding key with the doc's distilled facts
     // (reused for memory indexing — no extra LLM call). Paper: +9.4% recall@k.
     cfg.fact_augmented_keys = true;
+    // Tier-3: bi-temporal knowledge graph — extract entity-attribute edges with
+    // event time at ingest, resolve the latest/most-recent value deterministically
+    // at answer time (graph.rs). Targets knowledge-update / temporal / multi-session.
+    cfg.temporal_graph = true;
     // Retrieve more candidates so multi-evidence questions (knowledge-update,
     // temporal, multi-session counting) can see all their evidence; the reranker
     // re-trims for precision.
@@ -166,17 +170,27 @@ async fn main() {
     let do_ingest = mode != "eval";
     let do_eval = mode != "ingest";
     let cleanup = mode == "both";
+    // Graph-only backfill: build just the bi-temporal edge graph over an
+    // EXISTING chunk/fact index (reuse those collections; only the graph is new).
+    // Fast + clean A/B vs the non-graph baseline. Set ULTRAMEM_LME_GRAPH_ONLY=1.
+    let graph_only = std::env::var("ULTRAMEM_LME_GRAPH_ONLY").as_deref() == Ok("1");
 
     for (n, inst) in chosen.iter().enumerate() {
         let tag = sanitize(&inst.question_id);
 
         if do_ingest {
-            // Fresh namespace per question (isolated haystack).
+            // Fresh namespace per question (isolated haystack). Graph-only
+            // backfill clears just the graph (chunks/facts are reused as-is);
+            // a full ingest clears chunks.
             let _ = qdrant::delete_by_filter(
                 &reqwest::Client::new(),
                 &cfg.qdrant_url,
                 &cfg.qdrant_api_key,
-                &cfg.chunks_collection,
+                if graph_only {
+                    &cfg.graph_collection
+                } else {
+                    &cfg.chunks_collection
+                },
                 serde_json::json!({"must":[{"key":"container_tag","match":{"value":tag}}]}),
             )
             .await;
@@ -224,7 +238,11 @@ async fn main() {
             let (engine, sem) = (engine.clone(), sem.clone());
             handles.push(tokio::spawn(async move {
                 let _p = sem.acquire_owned().await.unwrap();
-                let _ = engine.add_document(&doc).await;
+                if graph_only {
+                    let _ = engine.add_document_graph_only(&doc).await;
+                } else {
+                    let _ = engine.add_document(&doc).await;
+                }
             }));
         }
         for h in handles {
@@ -305,6 +323,19 @@ async fn main() {
         };
 
         let mut context = String::new();
+        // Tier-3: resolved bi-temporal knowledge graph — deterministic
+        // latest/most-recent values with their dates, surfaced FIRST so the
+        // answer model trusts them over older values buried in the raw history.
+        let as_of = parse_date(&inst.question_date)
+            .filter(|&t| t > 0)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp());
+        let temporal_block = engine
+            .resolve_edges_tagged(&tag, &inst.question, as_of, 12)
+            .await;
+        if !temporal_block.is_empty() {
+            context.push_str(&temporal_block);
+            context.push('\n');
+        }
         if lead_with_facts {
             context.push_str(&facts_block(
                 "CURRENT facts (already reconciled to the latest values — TRUST THESE over any older value in the raw history below):",
@@ -364,13 +395,13 @@ async fn main() {
         // Tier-1: type-aware answering — tell the model how this category is scored.
         let guidance = match inst.question_type.as_str() {
             "single-session-preference" =>
-                "This is a preference question. Use the user's known preferences and personal details (from the profile and facts) to give a tailored recommendation. Do NOT refuse — reflect what the user likes.",
+                "This is a preference question. Identify the user's preference that is SPECIFICALLY relevant to THIS question's topic — the user has many interests, so match the one tied to exactly what is being asked, NOT their most-frequently-mentioned or loudest interest. Give a concrete, tailored recommendation that applies that on-topic preference to the request. Do NOT refuse and do NOT merely list facts — even if the exact subject (e.g. a specific city or item) is not in memory, apply the user's known preferences to make a real recommendation.",
             "multi-session" =>
                 "This requires counting/aggregating across multiple memories. Work step by step: list every distinct relevant item you find (with where it came from), then sum them. Do not double-count and do not miss any. Put the final total on the last line.",
             "temporal-reasoning" =>
                 "This requires date arithmetic. Use the 'dated' tags on each memory and today's date. Work step by step: identify the specific event(s) the question names and their dates, then compute the interval (or order). Put the final answer (e.g. the number of days/weeks) on the last line.",
             "knowledge-update" =>
-                "A fact may have been updated over time. Use the MOST RECENT value (latest date); ignore superseded earlier ones.",
+                "This is a knowledge-update question: a fact has CHANGED over time and you must report the CURRENT value. The context may hold several values for the same attribute on different dates — compare the dates and use ONLY the one with the LATEST date; earlier values are superseded and wrong. For 'most recent'/'latest' questions, pick the event with the newest date, never an older one. Use ONLY values stated in the memory; NEVER substitute real-world or general knowledge — if the user's memory states a value, it is correct even when it contradicts what you know about the real world.",
             _ => "Answer using the memory context.",
         };
         // Closing instruction by type. Chain-of-Note (copy relevant facts, then
@@ -533,7 +564,11 @@ async fn main() {
         // Clean this question's data out of the shared collections (only in
         // one-shot both-mode; ingest/eval modes keep it for fast re-eval).
         if cleanup {
-            for coll in [&cfg.chunks_collection, &cfg.facts_collection] {
+            for coll in [
+                &cfg.chunks_collection,
+                &cfg.facts_collection,
+                &cfg.graph_collection,
+            ] {
                 let _ = qdrant::delete_by_filter(
                     &reqwest::Client::new(),
                     &cfg.qdrant_url,
