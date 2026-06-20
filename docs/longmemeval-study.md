@@ -105,6 +105,9 @@ The fix is to give event time first‑class structure. `engine/graph.rs` extract
 
 The deeper point: prompting plateaued because some errors are **representational**, not reasoning failures. When the data lacks the structure a question needs (here, comparable event dates), no instruction recovers it; you change the *representation*. That is the same move — at the synthesis layer — that round‑level chunking and fact‑augmented keys made at the retrieval layer.
 
+### 3.9 A negative result, and the measurement wall
+A follow‑up tried date‑windowed counting *over the graph* to fix multi‑session ("how many weddings *this year*"). It **failed to fire on all 120 questions**: the entity‑*attribute* schema scatters each wedding across `wedding_venue` / `wedding_month` / `wedding_role` edges — there is no countable "attended‑wedding" node — so there was nothing coherent to count. **Counting distinct events needs entity *nodes*, which is the very multi‑hop/entity‑graph step we had deferred.** More telling: the re‑eval read **78.3%, but it was noise** — single‑session‑preference swung **45% → 70% with no preference code changed**. Run‑to‑run answer‑model nondeterminism is **±5 on volatile categories**, large enough that a single 120‑question run cannot distinguish a few‑point gain or detect a small regression. The only durable signal is the reproducible‑mechanism graph win (knowledge‑update); headline numbers above it require **multi‑run averaging** (or a deterministic answer model) to be trustworthy. **Lesson: past a point, measurement precision — not model or memory cleverness — gates progress, and a rising headline can be noise hiding an inert change.**
+
 ---
 
 ## 4. Discussion
