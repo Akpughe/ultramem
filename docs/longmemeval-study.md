@@ -6,7 +6,7 @@
 
 ## Abstract
 
-We benchmarked UltraMem, a two‑layer memory engine (raw content chunks + LLM‑distilled, time‑reconciled facts), on **LongMemEval‑S** — 500 questions, each buried in a ~50‑session / ~115k‑token chat haystack, across six abilities: single‑session user recall, single‑session assistant recall, preference, knowledge‑update, temporal reasoning, and multi‑session aggregation. Starting from an off‑the‑shelf configuration, a sequence of **architectural** changes — not model upgrades — moved the system from a distributed‑failure baseline to **single‑session recall solved (100%)** and the two hardest categories lifted **temporal 20%→80%** and **multi‑session 20%→60%**, reaching **70% overall** on a 30‑question slice. The central finding: on this task, **memory‑system design dominates model scale**. A frontier model (Gemini 2.5 Flash) tied a mid‑tier open model (Groq gpt‑oss‑120b); *more* context actively hurt; and the wins came from round‑level indexing, fact‑augmented retrieval keys, event‑time extraction, and **query decomposition for multi‑hop retrieval**.
+We benchmarked UltraMem, a two‑layer memory engine (raw content chunks + LLM‑distilled, time‑reconciled facts), on **LongMemEval‑S** — 500 questions, each buried in a ~50‑session / ~115k‑token chat haystack, across six abilities: single‑session user recall, single‑session assistant recall, preference, knowledge‑update, temporal reasoning, and multi‑session aggregation. Starting from an off‑the‑shelf configuration, a sequence of **architectural** changes — not model upgrades — moved the system from a distributed‑failure baseline to **single‑session recall solved (100%)** and the two hardest categories lifted **temporal 20%→80%** and **multi‑session 20%→60%**, reaching **70% overall** on a 30‑question slice. The central finding: on this task, **memory‑system design dominates model scale**. A frontier model (Gemini 2.5 Flash) tied a mid‑tier open model (Groq gpt‑oss‑120b); *more* context actively hurt; and the wins came from round‑level indexing, fact‑augmented retrieval keys, event‑time extraction, and **query decomposition for multi‑hop retrieval**. A subsequent low‑noise **120‑question** evaluation (Gemini 2.5 Flash judge) put the honest figure at **63.3%**, lifted to **66.7%** by type‑aware answer prompts, and isolated the remaining gap precisely: **retrieval is essentially solved (97.5% of gold sessions retrieved); 42 of 44 residual failures are answer *synthesis*.** One synthesis class — knowledge‑update ("what is the current value of X?") — proved **immune to prompting** because the competing old/new values reach the model with no per‑value dates to order them by. That motivated a **bi‑temporal knowledge‑graph** layer that resolves the latest value deterministically from event time; it fixes the exact cases prompting could not.
 
 ---
 
@@ -84,6 +84,20 @@ The ~63% on 5/category was partly luck: at **10/category the honest baseline was
 ### 3.6 The retrieval‑completeness theme
 The unifying lesson across temporal and multi‑session: their failures were never "the model is dumb" — they were **"the evidence wasn't all in front of it."** A single dense query is a poor instrument for multi‑hop questions; decomposing the question and unioning per‑sub‑query retrievals is what closed the gap. The `gold_retrieved=any` metric masked this for a long time (it reported "retrieval solved" while a needed second session was missing) — a measurement lesson in its own right.
 
+### 3.7 The trustworthy baseline and the synthesis wall
+A 120‑question run (20/category, ingest/eval split, **Gemini 2.5 Flash judge**, deterministic at temp 0) gave the honest low‑noise number: **63.3%**, with `gold_retrieved` true for **117/120 (97.5%)** and only **2** true retrieval‑misses — i.e. **42 of 44 failures are synthesis**, not retrieval. A prompt‑only, type‑aware answer pass lifted overall to **66.7%**, but the gain was uneven and diagnostic:
+
+| | preference | knowledge‑update |
+|---|---|---|
+| before → after | 30% → **45%** (real) | 60% → **60%** (no effect) |
+
+**Preference** improved by telling the model to answer the *on‑topic* preference rather than the user's loudest interest (the rubric wanted AI‑in‑healthcare; the model had been answering about the user's louder sustainability thread). **Knowledge‑update did not move at all** — the prompt reworded 19/20 answers but flipped none (still 300‑not‑120 for the Starbucks threshold, Hawaii‑not‑Paris for "most recent trip", 27:12‑not‑25:50 for the 5K best). Transcript inspection showed why: **both the old and new values are present in context, but they carry no machine‑comparable dates, so "use the latest" is an instruction the model cannot execute.** This is a structural gap, not a prompting one.
+
+### 3.8 Tier‑3 — a bi‑temporal knowledge graph makes "latest" deterministic
+The fix is to give event time first‑class structure. `engine/graph.rs` extracts `(subject, predicate, object)` edges, each stamped with **event‑time validity** (`valid_from`/`valid_to`) and an ingestion timestamp — the two time axes of the Zep/Graphiti model. A `singular` flag separates single‑valued **states** (a status, a count, a personal best — a newer value *supersedes*) from accumulating **events** (each trip taken — "most recent" is the max `valid_from`). Supersession and resolution are **pure Rust over event time** (unit‑tested), not an LLM judgment: at answer time the relevant attribute's full dated timeline is surfaced with the value valid *now* marked. On real conversations this extracted `personal_best_5k_time: 27:12 (superseded) → 25:50 (latest)` and the model answered correctly — *the exact knowledge‑update question that was wrong in two prior runs.* The layer is additive (a separate edge collection, retrieval otherwise unchanged), so it can be backfilled over an existing index — making it a clean A/B isolating the graph's effect. The full‑slice measurement is in progress.
+
+The deeper point: prompting plateaued because some errors are **representational**, not reasoning failures. When the data lacks the structure a question needs (here, comparable event dates), no instruction recovers it; you change the *representation*. That is the same move — at the synthesis layer — that round‑level chunking and fact‑augmented keys made at the retrieval layer.
+
 ---
 
 ## 4. Discussion
@@ -98,7 +112,8 @@ These also happen to be the right *product* investments for a memory engine inde
 
 - **Small N / judge.** Headline percentages are on 30 questions with a non‑GPT‑4o judge (Groq gpt‑oss‑120b, self‑consistent). Several "failures" were correct answers the judge rejected, so *effective* accuracy exceeds the printed score; conversely small‑N swings ±20%/category. The robust claims are the *structural* ones (which fix helps which category, and the failure‑profile shape), not the exact numbers.
 - **Single slice / one engine config.** Deterministic first‑k‑per‑type subset; not the full 500; not multiple seeds.
-- **No temporal knowledge graph yet** — the proven route to ~90% (Zep) remains unbuilt.
+- **Temporal knowledge graph: built, measurement pending.** The bi‑temporal edge layer (§3.8) is implemented, unit‑tested, and smoke‑validated, but its full 120‑question effect was still being measured at the time of writing; the ~90% Zep figure remains the target, not yet a result reproduced here.
+- **Answer‑model non‑determinism.** Even at 120‑Q, `gpt-oss-120b` introduces ±2–4 points of run‑to‑run overall noise (±1–2 per category), so sub‑5‑point movements in untouched categories are not signal.
 
 ---
 
@@ -106,7 +121,7 @@ These also happen to be the right *product* investments for a memory engine inde
 
 1. **Bigger N + GPT‑4o judge** for leaderboard‑faithful, low‑noise numbers.
 2. **Generalized Chain‑of‑Note reading** across all categories (+10 pts in the paper).
-3. **Temporal knowledge graph (Tier 3):** entity/relationship extraction, bi‑temporal validity edges, graph+vector fused retrieval — the architectural bet for ~90%.
+3. **Temporal knowledge graph (Tier 3) — now built (§3.8); next: measure at full slice**, then extend from entity‑attribute edges to multi‑hop relationship traversal and fuse graph + vector + time at retrieval (the full Zep recipe for ~90%).
 4. **Multi‑session counting precision:** decomposition surfaces the items; remaining errors are extraction precision (off‑by‑one), addressable with stricter per‑item evidence binding.
 
 ---
@@ -123,3 +138,5 @@ See `docs/longmemeval-roadmap.md` (run‑history tables + the tiered implementat
 - Multi‑session: **20% → 60%** (query decomposition + extract‑then‑compute).
 - Overall (30‑Q slice): **50% → 70%**, entirely via architecture (model held constant).
 - Cross‑model control: Gemini 2.5 Flash ≈ Groq gpt‑oss‑120b (model scale ≠ the lever).
+- Trustworthy 120‑Q (Gemini 2.5 Flash judge): **63.3% → 66.7%**; retrieval solved (**97.5%** gold retrieved); **42 / 44** residual failures are synthesis, not retrieval.
+- Tier‑3 bi‑temporal knowledge graph: **built + smoke‑validated** — deterministically fixes the knowledge‑update cases prompting could not (the 5K personal best); full‑slice number pending.

@@ -1,6 +1,6 @@
 # How UltraMem Gets to Near‑Perfect on LongMemEval‑S
 
-> Engineering analysis + implementation plan. Status: UltraMem sits at **~60–63%** on a 30‑question LongMemEval‑S slice; this document explains *why*, what the SOTA does, the specific loopholes in our code, and a tiered plan to close the gap.
+> Engineering analysis + implementation plan. **Status (2026‑06‑20):** trustworthy **120‑question** baseline **63.3%**, lifted to **66.7%** by a type‑aware answer‑prompt pass. **Retrieval is essentially solved (97.5% gold retrieved); the bottleneck is now answer *synthesis* (42 of 44 failures).** **Tier‑3 — the bi‑temporal knowledge graph — is now built, unit‑tested, and smoke‑validated** (it fixes the exact knowledge‑update cases prompting could not); a full 120‑question measurement is running. This document explains *why*, what the SOTA does, the loopholes, and the tiered plan.
 
 ---
 
@@ -141,6 +141,8 @@ Each item: **rationale (with measured gain) · code changes · effort · risk ·
 
 - **Effort:** XL (weeks; a real subsystem) · **Risk:** high · **Lift:** the path to ~90%. **This is a deliberate architectural bet — decide separately after Tier 1–2 plateau.**
 
+> **STATUS (2026‑06‑20): BUILT + smoke‑validated.** Implemented in `engine/graph.rs` as flat first‑class edge records (not nested payloads — Qdrant nested‑array temporal filtering is unreliable) on a dense `graph_collection`, with deterministic Rust supersession and an answer‑time `resolve_edges_tagged`. The `singular` state/event flag handles both "current value" (supersede) and "most recent" (max `valid_from`). It already fixes the knowledge‑update case prompting could not (the 5K personal best). 120‑Q measurement in progress — see the run‑history appendix.
+
 ---
 
 ## 7. Sequencing & milestones
@@ -234,3 +236,27 @@ Temporal extract‑then‑compute works when extraction is right (ordering, "4 w
 | **70.0** (21/30) | 100 | 100 | 40\* | 40\* | **80** | **60** |
 
 Implemented eval‑side (no re‑ingest): for temporal/multi‑session, an LLM splits the question into per‑event sub‑queries, each retrieved planner‑free, results unioned into context. **Temporal 20→80%, multi‑session 20→60%** — MoMA "7 days", keyboard "6 days", model kits "5", camping "8 days", Marvel+Star Wars "3.5 weeks" all correct. (\*preference/k‑update dips are 5‑Q noise + judge variance — they don't use decomposition.) Full narrative + analysis: **`docs/longmemeval-study.md`**.
+
+### 120‑question runs (20/category) — the trustworthy baseline (Gemini 2.5 Flash judge)
+
+The 30‑Q numbers above are noisy (±20%/cat). A **120‑question** run (20/category, ingest/eval split, Groq `gpt-oss-120b` answerer, **Gemini 2.5 Flash judge**) is the honest low‑noise number.
+
+| Config | Overall | user | asst | pref | k‑update | temporal | multi |
+|---|---|---|---|---|---|---|---|
+| **Baseline (full stack)** | **63.3** (76/120) | 85 | 70 | 30 | 60 | 75 | 60 |
+| **+ type‑aware answer prompts** | **66.7** (80/120) | 80 | 65 | **45** | 60 | 80 | 70 |
+
+**Headline finding: retrieval is essentially solved — 117/120 gold sessions retrieved (97.5%), only 2 retrieval‑misses. 42 of 44 failures are *synthesis* (evidence in context, answer still wrong).** The bottleneck has fully shifted from retrieval to answering.
+
+The type‑aware answer‑prompt pass (prompt‑only, no re‑ingest) gave **+4 overall**, but the signal is uneven:
+- **Preference +3 (30→45%) — real.** Telling the model to answer the *on‑topic* preference (not the loudest interest) recovered the diagnosed cases (publications wanted AI‑in‑healthcare, not sustainability; Miami hotel, cocktail).
+- **Knowledge‑update +0 — prompting can't fix it.** It reworded 19/20 answers but flipped zero: still 300‑not‑120 (Starbucks), Hawaii‑not‑Paris, 27:12‑not‑25:50. The values are *in context* but, lacking per‑value dates, "use the latest" is an instruction the model cannot act on. **This is what Tier‑3 is for.**
+- The ±1–2 wobble in untouched categories (user, assistant) is `gpt-oss-120b` run‑to‑run noise (±2–4 overall even at 120‑Q).
+
+### Tier‑3 (temporal knowledge graph) — BUILT + smoke‑validated; 120‑Q measurement running
+
+`engine/graph.rs` (new) extracts `(subject, predicate, object)` edges stamped with **event time** (`valid_from`/`valid_to`), with a `singular` flag separating single‑valued **states** (supersede) from accumulating **events**. Deterministic Rust supersession + `resolve()` surface the dated timeline with the current value marked; the answer model reads a "Temporal knowledge (resolved…)" block first. **10 unit tests + 76 lib tests green.**
+
+**Smoke validation on real conversations:** the graph extracted `personal_best_5k_time: 27:12 (superseded) → 25:50 (LATEST)` and the answer model used it — *"latest is 25:50… earlier was 27:12 but it has been superseded."* **That exact knowledge‑update question was wrong in both prior runs.** Both smoke KU questions passed 2/2.
+
+Engineering note: rather than a 7–9h full re‑ingest, a **graph‑only backfill** (`add_document_graph_only` + `ULTRAMEM_LME_GRAPH_ONLY`) builds *only* the edges over the existing `lme120` chunk/fact index — ~2.6× cheaper (~160k vs ~425k tokens/question) and a clean A/B (retrieval byte‑identical to the 66.7% baseline; the only changed variable is the graph). The 120‑question backfill into `ultramem_lme120_graph` is in progress; the eval and per‑category before/after will land here next.
