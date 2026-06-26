@@ -13,10 +13,10 @@ Durable score is **72.5%** (120-Q, Gemini 2.5 Flash judge). **Retrieval is solve
 
 - **Score:** **72.5%** (87/120) — durable. A 78.3% follow-up run exists but is noise (see §2).
 - **Git:** local `main` = `ef63267` (round notes), **1 commit ahead of `origin/main`** (`bbbf5c3`). **Not pushed.** Author identity is `Akpughe <davidakpughe2@gmail.com>`, no co-authors on any local commit.
-- **Uncommitted (intentional):** the **inert date-windowed counter** — `count_event_instances_tagged` (`src/engine/mod.rs`) + `parse_window` and the `is_count` restructure (`examples/longmemeval.rs`). It **fires 0/120**; decision pending: **revert** or **redo on entity nodes**.
+- **Committed but inert (gated, no-op):** the **date-windowed counter** — `count_event_instances_tagged` (`src/engine/mod.rs`) + `parse_window` and the `is_count` restructure (`examples/longmemeval.rs`). It **fires 0/120** (the graph has no countable event nodes); kept to be **redone on entity nodes**, not reverted.
 - **Data — remote Qdrant (`QDRANT_URL` = `*.nuton.app`, NOT local docker):** collections `ultramem_lme120_chunks` (77.5k), `ultramem_lme120_facts` (63.6k), `ultramem_lme120_graph` (33.7k edges). Per-question namespace tag = `lme_<question_id>`.
 - **Result files (gitignored, in `eval/`):** `lme120_results.json` = 63.3% baseline · `lme120b` = 66.7% (prompt pass) · **`lme120g` = 72.5% (graph — current best/durable)** · `lme120h` = 78.3% (noise run, windowed-count was inert).
-- **Open housekeeping decisions:** (a) push `ef63267`; (b) the inert counter code (revert vs hold); (c) `80fbf7e` is *already public* with the **old email + a Claude trailer** — fixing needs a force-push.
+- **Open housekeeping:** the one remaining item is `80fbf7e` — *already public* with the **old email + a Claude trailer**; scrubbing it needs a force-push.
 
 ## 2. THIS IS WHAT WE ACHIEVED
 
@@ -53,7 +53,7 @@ Durable score is **72.5%** (120-Q, Gemini 2.5 Flash judge). **Retrieval is solve
 
 1. **Pin the number — run the eval 3× and average.** Controls the ±5 noise so we can actually measure changes and detect regressions. *Prerequisite for everything below.* (eval-only, cheap; command in §How-to.)
 2. **Entity-node knowledge graph** — promote events/people/places to *nodes* (each wedding = one node). This **fixes multi-session counting** AND **unlocks multi-hop relationship traversal** — the Zep recipe and the real lever toward ~90%. Needs a graph re-ingest/backfill (the inert counter code folds into this).
-3. **Decide the inert counter code** — revert, or absorb into the entity-node work (#2).
+3. **Fold the (committed, gated) counter code into the entity-node work (#2)** — `parse_window` + `count_event_instances_tagged` are the seed; they need countable event nodes to fire.
 4. **(Optional) Leaderboard-faithful judge** — add a GPT-4o judge path for official-comparable numbers; stop tuning preference.
 5. **Housekeeping** — push `ef63267`; fix `80fbf7e` (force-push) if you want public history fully clean.
 
@@ -63,7 +63,7 @@ Durable score is **72.5%** (120-Q, Gemini 2.5 Flash judge). **Retrieval is solve
 
 ```bash
 # 1. Where the code is
-git log --oneline -5 && git status -s        # ef63267 on top; inert counter shows as modified
+git log --oneline -5 && git status -s        # newest docs/report/charts on top; tree clean
 
 # 2. The durable result (72.5%) — per-category
 python3 -c "import json,collections as c; d=json.load(open('eval/lme120g_results.json')); t=c.Counter(r['type'] for r in d if r['correct']); n=c.Counter(r['type'] for r in d); [print(k, t[k],'/',n[k]) for k in n]"
