@@ -460,25 +460,58 @@ async fn main() {
         let direct = || llm.chat(&answer_model, &answer_system, &inst.question, 0.0);
 
         let response = if is_count {
-            let sys = format!(
-                "List the SPECIFIC individual items the question asks to count, each as its own array element. \
-                 For example, for 'how many model kits' return [\"Revell F-15 Eagle\", \"Tamiya Spitfire\", ...] — the concrete instances, \
-                 NOT the category word [\"model kits\"]. One concrete item per element, no duplicates, no category labels, no prose. \
-                 Return ONLY the JSON array.\n\nMemory context:\n{context}"
-            );
-            let raw = llm
-                .chat(&reasoning_model, &sys, &inst.question, 0.0)
-                .await
-                .unwrap_or_default();
-            let items = parse_str_array(&raw);
-            if items.is_empty() {
-                direct().await.unwrap_or_else(|e| format!("<error: {e}>"))
+            // Graph-based date-windowed count FIRST — ONLY when the question has a
+            // recognizable window AND the graph yields the event group. Counting
+            // the dated event instances inside the window in Rust fixes the
+            // "weddings THIS YEAR → 5 vs 3" over-counts the LLM makes by ignoring
+            // the window. Everything else falls through to the unchanged
+            // extract-then-count path, so window-free counts can't regress.
+            let graph_windowed = match parse_window(&qlow, qdate_unix) {
+                Some((after, before)) => {
+                    let gi = engine
+                        .count_event_instances_tagged(&tag, &inst.question, 16)
+                        .await;
+                    let inwin: Vec<&(String, i64)> = gi
+                        .iter()
+                        .filter(|(_, t)| *t >= after && *t <= before)
+                        .collect();
+                    (!inwin.is_empty()).then(|| {
+                        format!(
+                            "{}. The items within the asked time window are: {}",
+                            inwin.len(),
+                            inwin
+                                .iter()
+                                .map(|(o, _)| o.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        )
+                    })
+                }
+                None => None,
+            };
+            if let Some(ans) = graph_windowed {
+                ans
             } else {
-                format!(
-                    "{}. The distinct items are: {}",
-                    items.len(),
-                    items.join("; ")
-                )
+                let sys = format!(
+                    "List the SPECIFIC individual items the question asks to count, each as its own array element. \
+                     For example, for 'how many model kits' return [\"Revell F-15 Eagle\", \"Tamiya Spitfire\", ...] — the concrete instances, \
+                     NOT the category word [\"model kits\"]. One concrete item per element, no duplicates, no category labels, no prose. \
+                     Return ONLY the JSON array.\n\nMemory context:\n{context}"
+                );
+                let raw = llm
+                    .chat(&reasoning_model, &sys, &inst.question, 0.0)
+                    .await
+                    .unwrap_or_default();
+                let items = parse_str_array(&raw);
+                if items.is_empty() {
+                    direct().await.unwrap_or_else(|e| format!("<error: {e}>"))
+                } else {
+                    format!(
+                        "{}. The distinct items are: {}",
+                        items.len(),
+                        items.join("; ")
+                    )
+                }
             }
         } else if is_temporal {
             let sys = format!(
@@ -656,6 +689,67 @@ fn parse_date(s: &str) -> Option<i64> {
         .and_utc()
         .timestamp()
         .into()
+}
+
+/// Detect a date window in a counting question and resolve it to (after, before)
+/// unix bounds against the question date. Returns None when no recognizable
+/// window phrase is present (the caller then counts without filtering — so this
+/// only ever *adds* date-window awareness, never changes window-free counts).
+fn parse_window(qlow: &str, qdate: Option<i64>) -> Option<(i64, i64)> {
+    use chrono::Datelike;
+    let now = qdate?;
+    let dt = chrono::DateTime::from_timestamp(now, 0)?;
+    if qlow.contains("this year") {
+        let jan1 = chrono::NaiveDate::from_ymd_opt(dt.year(), 1, 1)?
+            .and_hms_opt(0, 0, 0)?
+            .and_utc()
+            .timestamp();
+        return Some((jan1, now));
+    }
+    if qlow.contains("this month") {
+        let m1 = chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)?
+            .and_hms_opt(0, 0, 0)?
+            .and_utc()
+            .timestamp();
+        return Some((m1, now));
+    }
+    // "(past|last|in the past|in the last|over the past) [N] <day|week|month|year>(s)"
+    let words = [
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+        "twelve",
+    ];
+    for kw in [
+        "in the past ",
+        "in the last ",
+        "over the past ",
+        "over the last ",
+        "past ",
+        "last ",
+    ] {
+        let Some(idx) = qlow.find(kw) else { continue };
+        let toks: Vec<&str> = qlow[idx + kw.len()..].split_whitespace().collect();
+        if toks.is_empty() {
+            continue;
+        }
+        let (n, unit_tok) = if let Ok(d) = toks[0].parse::<i64>() {
+            (d, toks.get(1).copied().unwrap_or(""))
+        } else if let Some(wi) = words.iter().position(|w| *w == toks[0]) {
+            (wi as i64 + 1, toks.get(1).copied().unwrap_or(""))
+        } else {
+            (1, toks[0])
+        };
+        let secs = match unit_tok.trim_end_matches('s') {
+            "day" => 86_400,
+            "week" => 7 * 86_400,
+            "month" => 30 * 86_400,
+            "year" => 365 * 86_400,
+            _ => 0,
+        };
+        if secs > 0 {
+            return Some((now - n * secs, now));
+        }
+    }
+    None
 }
 
 /// Split a multi-hop question into per-event/entity search phrases (one LLM

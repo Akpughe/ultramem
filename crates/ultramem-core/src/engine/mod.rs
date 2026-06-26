@@ -1000,6 +1000,82 @@ impl MemoryEngine {
         graph::render_block(&graph::resolve(&edges, as_of))
     }
 
+    /// For a counting question, return the dated instances of the single
+    /// best-matching EVENT group (non-singular edges) in the graph, deduped by
+    /// object. The caller applies any date window and counts — so "how many
+    /// weddings this year" becomes a structured, date-filtered count in Rust
+    /// rather than an LLM tally that ignores the window. Empty when the graph is
+    /// off or no event group matches.
+    pub async fn count_event_instances_tagged(
+        &self,
+        tag: &str,
+        query: &str,
+        limit: usize,
+    ) -> Vec<(String, i64)> {
+        let cfg = self.cfg();
+        if !cfg.temporal_graph {
+            return vec![];
+        }
+        let qv = match self
+            .embedder
+            .embed(EmbedTask::Query, &[query.to_string()])
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => return vec![],
+        };
+        let Some(qvec) = qv.first() else {
+            return vec![];
+        };
+        let hits = self
+            .store
+            .search(
+                &cfg.graph_collection,
+                qvec,
+                limit,
+                0.3,
+                Some(tagged_filter(None, tag)),
+            )
+            .await
+            .unwrap_or_default();
+        // The single best-matching EVENT group: the top hit whose edge is an
+        // accumulating event (singular=false), not a single-valued state.
+        let best = hits.iter().find_map(|h| {
+            let p = &h["payload"];
+            if p["singular"].as_bool() == Some(false) {
+                Some((
+                    p["subject"].as_str()?.to_string(),
+                    p["predicate"].as_str()?.to_string(),
+                ))
+            } else {
+                None
+            }
+        });
+        let Some((subject, predicate)) = best else {
+            return vec![];
+        };
+        // Every distinct instance in that group, with its event date.
+        let mut seen = std::collections::HashSet::new();
+        let mut out: Vec<(String, i64)> = Vec::new();
+        for p in self
+            .store
+            .scroll_all(&cfg.graph_collection, Some(tagged_filter(None, tag)), 4000)
+            .await
+            .unwrap_or_default()
+        {
+            let Some(se) = stored_edge_from_payload(&p) else {
+                continue;
+            };
+            if se.edge.subject == subject
+                && se.edge.predicate == predicate
+                && seen.insert(se.edge.object.to_lowercase())
+            {
+                out.push((se.edge.object, se.edge.valid_from));
+            }
+        }
+        out
+    }
+
     /// Ask-time retrieval. A fast planning pass first resolves relative dates,
     /// detects source intent ("websites I visited" → browser) and list-style
     /// questions; the plan becomes a Qdrant payload filter. Then the planned
