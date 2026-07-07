@@ -744,8 +744,8 @@ impl MemoryEngine {
         // Reconcile against the existing memory graph (skip when disabled — then
         // every fact is simply NEW).
         let actions = if cfg.memory_graph {
-            // For each new fact, find its single nearest *latest* memory.
-            let mut with_neighbors: Vec<(String, Option<memory::Neighbor>)> =
+            // For each new fact, find its top-k nearest *latest* memories.
+            let mut with_neighbors: Vec<(String, Vec<memory::Neighbor>)> =
                 Vec::with_capacity(facts.len());
             for (fact, vec) in facts.iter().zip(fvecs.iter()) {
                 // Reconcile only within the same namespace — a fact in tenant A
@@ -759,23 +759,26 @@ impl MemoryEngine {
                     .search(
                         &cfg.facts_collection,
                         vec,
-                        1,
+                        memory::RECONCILE_TOPK,
                         memory::RELATE_THRESHOLD,
                         Some(neighbor_filter),
                     )
                     .await
                     .unwrap_or_default();
-                let neighbor = hits.first().and_then(|h| {
-                    Some(memory::Neighbor {
-                        memory_id: h["id"].as_str()?.to_string(),
-                        fact: h["payload"]["fact"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_string(),
-                        score: h["score"].as_f64().unwrap_or(0.0) as f32,
+                let neighbors = hits
+                    .iter()
+                    .filter_map(|h| {
+                        Some(memory::Neighbor {
+                            memory_id: h["id"].as_str()?.to_string(),
+                            fact: h["payload"]["fact"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string(),
+                            score: h["score"].as_f64().unwrap_or(0.0) as f32,
+                        })
                     })
-                });
-                with_neighbors.push((fact.clone(), neighbor));
+                    .collect();
+                with_neighbors.push((fact.clone(), neighbors));
             }
             memory::reconcile(self.llm.as_ref(), &cfg.distill_model, with_neighbors).await
         } else {
@@ -790,23 +793,25 @@ impl MemoryEngine {
                 .collect()
         };
 
-        // Build points for everything that survives (drop DUPLICATEs), and
-        // collect the ids of memories that got superseded.
+        // Build points. Split them so a fact that SUPERSEDES an existing memory
+        // is only written after that memory has actually been demoted (Task 3) —
+        // otherwise a failed flip would leave both the old and new value served
+        // as "latest". NeedsReview facts are stored but quarantined
+        // (`needs_review=true`), held out of active retrieval until reviewed.
         let fact_vec: std::collections::HashMap<&str, &Vec<f32>> =
             facts.iter().map(|s| s.as_str()).zip(fvecs.iter()).collect();
-        let mut points: Vec<Value> = Vec::new();
+        let mut plain_points: Vec<Value> = Vec::new();
+        let mut supersede_points: Vec<Value> = Vec::new();
         let mut superseded: Vec<String> = Vec::new();
         for action in &actions {
             if action.relation == memory::Relation::Duplicate {
                 continue;
             }
-            if let Some(old) = &action.supersedes {
-                superseded.push(old.clone());
-            }
             let Some(vec) = fact_vec.get(action.fact.as_str()) else {
                 continue;
             };
-            points.push(json!({
+            let needs_review = action.relation == memory::Relation::NeedsReview;
+            let point = json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "vector": vec,
                 "payload": {
@@ -816,32 +821,62 @@ impl MemoryEngine {
                     "source": doc.source,
                     "captured_at": doc.captured_at,
                     "is_latest": true,
+                    "needs_review": needs_review,
                     "kind": "fact",
                     "supersedes": action.supersedes,
                     "extends": action.extends,
                     "valid_until": expiry.get(action.fact.as_str()).copied().flatten(),
                     "container_tag": doc.tag(),
                 },
-            }));
+            });
+            if let Some(old) = &action.supersedes {
+                superseded.push(old.clone());
+                supersede_points.push(point);
+            } else {
+                plain_points.push(point);
+            }
         }
 
-        self.store.upsert(&cfg.facts_collection, points).await?;
+        // Non-superseding facts are always safe to write.
+        self.store
+            .upsert(&cfg.facts_collection, plain_points)
+            .await?;
 
-        // Flag superseded memories as no longer latest (history preserved).
+        // Superseding facts: demote the old memories FIRST (with a couple of
+        // retries), and only write the new values if that succeeds. If the flip
+        // can't be made durable, drop the superseding writes rather than serve
+        // two "latest" values, and surface the error so a reindex can retry.
         if !superseded.is_empty() {
-            if let Err(e) = self
-                .store
-                .set_payload(
-                    &cfg.facts_collection,
-                    &superseded,
-                    json!({ "is_latest": false }),
-                )
-                .await
-            {
-                eprintln!(
-                    "[recally] failed to flag {} superseded memories: {e}",
-                    superseded.len()
-                );
+            let mut flipped = false;
+            let mut last_err = String::new();
+            for _ in 0..3 {
+                match self
+                    .store
+                    .set_payload(
+                        &cfg.facts_collection,
+                        &superseded,
+                        json!({ "is_latest": false }),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        flipped = true;
+                        break;
+                    }
+                    Err(e) => last_err = e,
+                }
+            }
+            if flipped {
+                self.store
+                    .upsert(&cfg.facts_collection, supersede_points)
+                    .await?;
+            } else {
+                return Err(format!(
+                    "supersession flip failed for {} memories ({last_err}); {} superseding fact(s) \
+                     not written to avoid serving stale+current together — retry via reindex",
+                    superseded.len(),
+                    supersede_points.len()
+                ));
             }
         }
         Ok(())
@@ -1701,9 +1736,10 @@ fn doc_delete_filter(doc_id: &str, tag: &str) -> Value {
 }
 
 /// Wrap a base filter (or none) so it also excludes memories that are no longer
-/// current: superseded (`is_latest = false`) or expired (`valid_until < now`).
-/// Legacy facts lack both fields, so neither exclusion matches them — they stay
-/// searchable (treated as latest, never-expiring). `now` is unix seconds.
+/// current: superseded (`is_latest = false`), expired (`valid_until < now`), or
+/// quarantined pending review (`needs_review = true`). Legacy facts lack all
+/// three fields, so no exclusion matches them — they stay searchable (treated as
+/// latest, never-expiring, reviewed). `now` is unix seconds.
 fn active_facts_filter(base: Option<Value>, now: i64) -> Value {
     let mut f = base.unwrap_or_else(|| json!({}));
     if let Some(obj) = f.as_object_mut() {
@@ -1711,6 +1747,7 @@ fn active_facts_filter(base: Option<Value>, now: i64) -> Value {
         if let Some(a) = must_not.as_array_mut() {
             a.push(json!({ "key": "is_latest", "match": { "value": false } }));
             a.push(json!({ "key": "valid_until", "range": { "lt": now } }));
+            a.push(json!({ "key": "needs_review", "match": { "value": true } }));
         }
     }
     f
