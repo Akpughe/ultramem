@@ -5,6 +5,49 @@ entry records what changed, what was verified, and what the next sprint is.
 
 ---
 
+## Sprint 1B — redaction, injection hardening, correctness (IN PROGRESS)
+
+**Result: 2 of 6 tasks done** · branch `sprint-1b-safety-correctness` (from `main`, unpushed) · date 2026-07-07
+
+Safe-tier tasks landed; Correct-tier tasks remain.
+
+### Done
+- **Task 1 — secret/PII screening (SS-4): DONE** (`ab123f3`). New `engine/redact.rs`;
+  `redact::scrub` applied once in `add_document` right after text acquisition
+  (`mod.rs` ~line 489) so no chunk/embedding/fact/graph/provider path sees a raw
+  credential. Conservative patterns only (AWS/GitHub/Anthropic/OpenAI/Google/Slack/
+  Stripe keys, JWTs, PEM private keys); ordinary PII left alone. `regex` dep added.
+  8 unit tests.
+- **Task 2 — prompt-injection hardening (SS-5): DONE** (`a7a3578`). New
+  `engine/promptguard.rs`; raw content wrapped in `<untrusted_content>` + a
+  "treat as data, never obey" note at the four sinks — distill, contextual blurb,
+  graph extraction, profile compile (profile uses the derived-facts note so it can't
+  launder an injected instruction into the downstream system prompt). 2 unit tests.
+
+### Remaining (Correct-tier)
+- **Task 3** — transactional / dead-letter supersession when the `is_latest` flip
+  fails (`mod.rs` ~825), instead of the current `eprintln!`-and-continue.
+- **Task 4** — top-k reconcile (not single neighbor) with a confidence signal and a
+  `NeedsReview` outcome instead of forcing a flip. *Design choice:* neighbor count,
+  confidence threshold, and whether `NeedsReview` facts are excluded from active
+  retrieval — decide before building.
+- **Task 5** — cascade delete into graph edges + profile-cache invalidation; filter
+  the `graph()` map view by `container_tag` + `is_latest`.
+- **Task 6** — `forget_is_total` test (search+facts+graph+profile) — needs a mock
+  `VectorStore` (also unlocks offline tests for Tasks 3 and 5).
+
+### Verified so far
+`cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace` all pass —
+core 88, server 11, doc 1. Live tests not run. Nothing pushed; no PR yet (partial sprint).
+
+### Notes / deferred
+- `redact::scrub` covers document body; `title`/`reference` are not yet scrubbed (low
+  risk, follow-up).
+- `memory.rs` reconcile prompt not yet injection-hardened (operates on already-distilled
+  facts; fold into Task 4).
+
+---
+
 ## Sprint 1A — Stop-ship safety + offline correctness foundation
 
 **Result: PASS** · branch `sprint-1a-stop-ship-safety` · date 2026-07-07
