@@ -1446,12 +1446,28 @@ impl MemoryEngine {
         self.profile_tagged(tag).await
     }
 
+    /// Drop the cached profile for a namespace so the next `profile_tagged`
+    /// recompiles from current facts. Cheap (no LLM) — used after a delete so a
+    /// forgotten fact can't keep being asserted from a stale cached profile.
+    pub fn invalidate_profile(&self, tag: &str) {
+        self.profile_cache.write().unwrap().remove(tag);
+    }
+
     /// The memory graph for the map view: distilled facts connected to the
     /// documents they were learned from. Document metadata comes from each
     /// fact's payload, so one scroll over the facts collection is enough.
-    pub async fn graph(&self, limit: usize) -> Result<Value, String> {
+    pub async fn graph(&self, tag: &str, limit: usize) -> Result<Value, String> {
         let cfg = self.cfg();
-        let points = self.store.scroll(&cfg.facts_collection, limit).await?;
+        // Scope to the namespace and to current facts only — an unfiltered scroll
+        // leaked superseded/expired/quarantined facts and other tenants' data.
+        let filter = tagged_filter(
+            Some(active_facts_filter(None, chrono::Utc::now().timestamp())),
+            tag,
+        );
+        let points = self
+            .store
+            .scroll_all(&cfg.facts_collection, Some(filter), limit)
+            .await?;
 
         let mut nodes: Vec<Value> = Vec::new();
         let mut edges: Vec<Value> = Vec::new();
@@ -1668,10 +1684,22 @@ impl MemoryEngine {
         let (a, b) = tokio::join!(
             self.store
                 .delete_by_filter(&cfg.chunks_collection, filter.clone()),
-            self.store.delete_by_filter(&cfg.facts_collection, filter),
+            self.store
+                .delete_by_filter(&cfg.facts_collection, filter.clone()),
         );
         a?;
         b?;
+        // Cascade: knowledge-graph edges derived from this document must go too,
+        // or a "forgotten" fact keeps resolving into answers via the graph. Only
+        // when the graph tier is enabled (else the collection may not exist).
+        if cfg.temporal_graph {
+            self.store
+                .delete_by_filter(&cfg.graph_collection, filter)
+                .await?;
+        }
+        // And drop the cached profile so the deleted fact isn't still asserted
+        // from a stale standing profile for up to the TTL.
+        self.invalidate_profile(tag);
         Ok(true)
     }
 }
@@ -2059,6 +2087,21 @@ mod tests {
             .iter()
             .any(|c| c["key"] == "doc_id" && c["match"]["value"] == "doc-xyz"));
         assert!(f["should"].as_array().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn active_facts_filter_excludes_superseded_expired_and_review() {
+        // Backs both the retrieval holdout (Task 4) and the scoped map view (Task 5):
+        // current facts only — not superseded, expired, or quarantined-for-review.
+        let f = active_facts_filter(None, 1_000);
+        let must_not = f["must_not"].as_array().unwrap();
+        assert!(must_not
+            .iter()
+            .any(|c| c["key"] == "is_latest" && c["match"]["value"] == false));
+        assert!(must_not.iter().any(|c| c["key"] == "valid_until"));
+        assert!(must_not
+            .iter()
+            .any(|c| c["key"] == "needs_review" && c["match"]["value"] == true));
     }
 
     #[test]
