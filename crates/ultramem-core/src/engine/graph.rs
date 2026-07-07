@@ -147,7 +147,11 @@ pub fn parse_edges(raw: &str, doc_date: &str) -> Vec<Edge> {
             _ => true,
         };
         out.push(Edge {
-            subject: if subject.is_empty() { "user".into() } else { subject },
+            subject: if subject.is_empty() {
+                "user".into()
+            } else {
+                subject
+            },
             predicate,
             object,
             valid_from,
@@ -212,8 +216,7 @@ pub fn supersession(new: &Edge, existing_same_group: &[StoredEdge]) -> (Vec<Stri
             continue;
         }
         // A strictly newer (or same-time but later-learned) value wins.
-        let newer = new.valid_from > ex.edge.valid_from
-            || (new.valid_from == ex.edge.valid_from);
+        let newer = new.valid_from >= ex.edge.valid_from;
         if newer {
             superseded.push(ex.id.clone());
         } else {
@@ -253,8 +256,7 @@ pub fn resolve(edges: &[StoredEdge], as_of: i64) -> Vec<Resolved> {
         // Current = latest object valid at as_of; else the earliest known.
         let current_member = members
             .iter()
-            .filter(|e| e.edge.valid_from <= as_of)
-            .next_back()
+            .rfind(|e| e.edge.valid_from <= as_of)
             .or_else(|| members.first())
             .unwrap();
         out.push(Resolved {
@@ -338,7 +340,14 @@ mod tests {
     fn day(s: &str) -> i64 {
         ymd_to_unix(s).unwrap()
     }
-    fn stored(id: &str, pred: &str, obj: &str, date: &str, singular: bool, latest: bool) -> StoredEdge {
+    fn stored(
+        id: &str,
+        pred: &str,
+        obj: &str,
+        date: &str,
+        singular: bool,
+        latest: bool,
+    ) -> StoredEdge {
         StoredEdge {
             id: id.into(),
             edge: Edge {
@@ -356,9 +365,15 @@ mod tests {
 
     #[test]
     fn normalize_key_canonicalizes() {
-        assert_eq!(normalize_key("Family Trip Destination"), "family_trip_destination");
+        assert_eq!(
+            normalize_key("Family Trip Destination"),
+            "family_trip_destination"
+        );
         assert_eq!(normalize_key("  job-title!! "), "job_title");
-        assert_eq!(normalize_key("starbucks_gold_star_threshold"), "starbucks_gold_star_threshold");
+        assert_eq!(
+            normalize_key("starbucks_gold_star_threshold"),
+            "starbucks_gold_star_threshold"
+        );
     }
 
     #[test]
@@ -412,7 +427,14 @@ mod tests {
     #[test]
     fn singular_older_value_does_not_win() {
         // Existing newer (Paris 2023-06). New older (Hawaii 2023-02) → new not latest.
-        let existing = vec![stored("p", "trip_current", "Paris", "2023-06-15", true, true)];
+        let existing = vec![stored(
+            "p",
+            "trip_current",
+            "Paris",
+            "2023-06-15",
+            true,
+            true,
+        )];
         let new = Edge {
             subject: "user".into(),
             predicate: "trip_current".into(),

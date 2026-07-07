@@ -166,7 +166,9 @@ async fn run_memtest(cfg: &EngineCfg) {
             ],
             query: "what running shoe brand does the user prefer now",
             must_contain: vec!["puma"],
-            must_absent: vec![],
+            // The superseded brand must be GONE from the served facts, not merely
+            // outranked — this is the "only the current fact is served" guarantee.
+            must_absent: vec!["adidas"],
             expect_superseded: true,
         },
     ];
