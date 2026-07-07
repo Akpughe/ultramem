@@ -5,6 +5,38 @@ entry records what changed, what was verified, and what the next sprint is.
 
 ---
 
+## Sprint 1C — evaluation & reproducibility (COMPLETE)
+
+**Result: PASS — 5 of 5 items done** · branch `sprint-1c-eval` (from `main`) · date 2026-07-07
+
+- **Fix `gold_retrieved`** (`76db24d`) — the attribution metric used `.any()` over gold sessions
+  (scored "retrieved" if just one of several required sessions surfaced — the broken metric the
+  roadmap flagged). Now `.all()`, via a pure `all_gold_retrieved` + unit test. CI upgraded to
+  `cargo test --all-targets` + `--doc` so the eval-harness example tests actually gate.
+- **Contradiction-chain eval** (`a8b57a3`) — offline `contradiction_chain_serves_only_latest`
+  (A→B→C serves only C, via the mock store) + a live memtest chain scenario (Puma present,
+  Adidas AND Nike absent).
+- **Permission-leak eval** (`a8b57a3`) — offline `active_scroll_is_namespace_isolated` (two
+  tenants, each active+tagged scroll returns only its own).
+- **Hard distractor corpus + reproducible golden** (`2a81259`) — `eval/corpus_hard.json` (12 docs,
+  4 near-duplicate clusters) + committed deterministic `eval/hard_gold.json` keyed by title; bench
+  now matches target by doc_id OR title so a committed golden needs no stable ingest ids.
+  Documented in `docs/benchmarks.md`.
+- **Injection eval** (`5e9fd36`) — capturing mock LLM + deterministic offline test proving SS-5 is
+  wired at the distill sink (poisoned content arrives wrapped in `<untrusted_content>` with a
+  "never obey" system prompt), not just present in `promptguard`.
+
+### Verified
+`cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace --all-targets` + `--doc` all pass
+— **core 100, harness 3, server 11, doc 1; 0 failed**. Live `ULTRAMEM_PIPELINE_TESTS` not run.
+
+### Deferred (future eval work)
+- Live adversarial injection/poison scenarios (behavioral, need an LLM) beyond the wiring test.
+- Abstention (`_abs`) instances + a leaderboard-faithful judge in the LME harness.
+- 3×-averaged LME runs to control the documented ±5-pt noise.
+
+---
+
 ## Sprint 1B — redaction, injection hardening, correctness (COMPLETE)
 
 **Result: PASS — 6 of 6 tasks done** · branch `sprint-1b-safety-correctness` (from `main`, unpushed) · date 2026-07-07
