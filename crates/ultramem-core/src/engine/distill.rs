@@ -67,14 +67,17 @@ pub async fn distill_facts(
     } else {
         format!("Conversation date: {doc_date}\n")
     };
+    // SS-5: the document body is untrusted; wrap it and tell the model so.
+    let system = format!("{EXTRACT_SYSTEM}{}", super::promptguard::UNTRUSTED_NOTE);
     let mut all: Vec<String> = Vec::new();
     let total = segments.len();
     for (i, seg) in segments.iter().enumerate() {
         let user = format!(
-            "{date_line}Title: {title}\nPart {} of {total}\n\n{seg}",
-            i + 1
+            "{date_line}Title: {title}\nPart {} of {total}\n\n{}",
+            i + 1,
+            super::promptguard::wrap_untrusted(seg)
         );
-        match llm.chat(model, EXTRACT_SYSTEM, &user, 0.3).await {
+        match llm.chat(model, &system, &user, 0.3).await {
             Ok(raw) => match parse_facts(&raw, MAX_FACTS_PER_SEGMENT) {
                 Some(facts) => all.extend(facts),
                 None => eprintln!(

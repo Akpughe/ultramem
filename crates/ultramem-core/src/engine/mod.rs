@@ -16,6 +16,7 @@ pub mod jina;
 pub mod memory;
 pub mod mistral;
 pub mod profile;
+pub mod promptguard;
 pub mod qdrant;
 pub mod redact;
 pub mod rewrite;
