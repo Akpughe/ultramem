@@ -116,6 +116,11 @@ pub struct EngineCfg {
     /// collection). Turns knowledge-update's "use the latest value" from an LLM
     /// guess into a deterministic event-time query.
     pub temporal_graph: bool,
+    /// Postgres source-of-truth connection string (Phase A). Env:
+    /// `ULTRAMEM_PG_URL`. `None` → the engine runs exactly as before (Qdrant is
+    /// the only store). Set it to enable the relational source of truth. Scaffold
+    /// only for now — the engine does not yet dual-write.
+    pub pg_url: Option<String>,
 }
 
 impl Default for EngineCfg {
@@ -147,6 +152,7 @@ impl Default for EngineCfg {
             multi_query: true,
             fetch_web_bodies: false,
             temporal_graph: false,
+            pg_url: None,
         }
     }
 }
@@ -201,6 +207,9 @@ impl EngineCfg {
                     c
                 }
             },
+            pg_url: std::env::var("ULTRAMEM_PG_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
             ..Default::default()
         }
     }

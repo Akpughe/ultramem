@@ -23,6 +23,7 @@ url = "2"
 futures-util = "0.3"
 async-trait = "0.1"
 regex = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "migrate", "macros"] }
 dotenvy = "0.15"
 walkdir = "2"
 dirs = "5"
