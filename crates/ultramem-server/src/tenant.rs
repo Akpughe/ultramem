@@ -85,7 +85,9 @@ pub struct AuthConfig {
 impl AuthConfig {
     /// Build from process env. Sources, in precedence order:
     /// - `ULTRAMEM_TENANTS`: `key=tag1,tag2` entries separated by `;` or newline;
-    ///   a tag of `*` means [`TagPolicy::Any`]. This is the multi-tenant path.
+    ///   a tag of `*` means [`TagPolicy::Any`]. An entry with no tags (`key=`) is
+    ///   dropped (fail closed — a typo must not grant wildcard access). This is
+    ///   the multi-tenant path.
     /// - `ULTRAMEM_API_KEY`: if set and not already present in `ULTRAMEM_TENANTS`,
     ///   it is added with [`TagPolicy::Any`] (backward compatible — one trusted
     ///   key that manages its own tags, as the quickstart shows).
@@ -120,8 +122,13 @@ impl AuthConfig {
                     .filter(|t| !t.is_empty())
                     .map(String::from)
                     .collect();
-                let policy = if tags.iter().any(|t| t == "*") || tags.is_empty() {
+                let policy = if tags.iter().any(|t| t == "*") {
                     TagPolicy::Any
+                } else if tags.is_empty() {
+                    // Malformed entry (`key=` with no tags): fail CLOSED — leave the
+                    // key unregistered so it grants nothing, rather than defaulting
+                    // to wildcard access. A typo must never widen access.
+                    continue;
                 } else {
                     TagPolicy::Only(tags)
                 };
@@ -228,6 +235,20 @@ mod tests {
                 .resolve_tag(&Some("anything".into())),
             Ok("anything".into())
         );
+    }
+
+    #[test]
+    fn empty_tag_list_fails_closed() {
+        // A malformed `key=` (no tags) must NOT become a wildcard. The key is left
+        // unregistered so it grants nothing; a valid entry alongside it survives.
+        let cfg = AuthConfig::build(Some("good=tenant_a; bad="), None, false);
+        assert!(cfg.resolve(Some("good")).is_some());
+        assert!(
+            cfg.resolve(Some("bad")).is_none(),
+            "empty-tag entry must not be a usable (wildcard) credential"
+        );
+        // A config with only a malformed entry has no usable keys.
+        assert!(AuthConfig::build(Some("k="), None, false).is_misconfigured());
     }
 
     #[test]
