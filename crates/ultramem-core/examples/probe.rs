@@ -426,9 +426,15 @@ async fn run_bench(engine: &MemoryEngine, cfg: &EngineCfg, build: bool) {
         let (docs, facts) = engine.retrieve(&item.query, 10).await.unwrap_or_default();
         latencies_ms.push(t0.elapsed().as_millis());
 
+        // Match the target by doc_id (generated goldens) OR by title, so a
+        // COMMITTED, reproducible golden can key on the stable title instead of a
+        // random per-ingest doc_id. Titles are unique within a corpus.
         let rank = docs
             .iter()
-            .position(|d| d.document_id == item.doc_id)
+            .position(|d| {
+                d.document_id == item.doc_id
+                    || (!item.title.is_empty() && d.title.as_deref() == Some(item.title.as_str()))
+            })
             .map(|p| p as i32 + 1)
             .unwrap_or(-1);
         ranks.push(rank);
