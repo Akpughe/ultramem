@@ -17,6 +17,7 @@ base64.workspace = true
 url.workspace = true
 futures-util.workspace = true
 async-trait.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 dotenvy.workspace = true

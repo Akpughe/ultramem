@@ -17,6 +17,7 @@ pub mod memory;
 pub mod mistral;
 pub mod profile;
 pub mod qdrant;
+pub mod redact;
 pub mod rewrite;
 pub mod sparse;
 pub mod urlinfo;
@@ -486,6 +487,10 @@ impl MemoryEngine {
             content
         };
         let content: String = content.chars().take(MAX_DOC_CHARS).collect();
+        // 1b. Scrub high-confidence secrets (SS-4) at the single choke point —
+        // before chunking, embedding, storage, distillation, or any provider
+        // call sees the text. Conservative: credentials only, not ordinary PII.
+        let content = redact::scrub(&content);
 
         // 2. Chunk — strategy follows content type (markdown by heading,
         // transcript by speaker turn, else paragraph).
