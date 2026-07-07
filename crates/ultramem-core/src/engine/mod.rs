@@ -2171,6 +2171,103 @@ mod tests {
         });
     }
 
+    // A fact point as stored in the facts collection.
+    fn fact_point(id: &str, tag: &str, fact: &str, is_latest: bool) -> Value {
+        json!({ "id": id, "vector": [0.0], "payload": {
+            "doc_id": id, "container_tag": tag, "fact": fact, "is_latest": is_latest,
+        }})
+    }
+
+    /// Contradiction chain A→B→C: each supersede flips the prior fact's
+    /// is_latest, so an active scroll must serve ONLY the newest value — never a
+    /// stale link in the chain. The offline serving-invariant behind memtest's
+    /// (live) knowledge-update scenario.
+    #[test]
+    fn contradiction_chain_serves_only_latest() {
+        use crate::providers::mock::MemStore;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = MemStore::new();
+            let (tag, now) = ("t", 1_000_000i64);
+            // A (latest) → B supersedes A → C supersedes B.
+            store
+                .upsert("f", vec![fact_point("a", tag, "prefers Adidas", true)])
+                .await
+                .unwrap();
+            store
+                .set_payload("f", &["a".into()], json!({ "is_latest": false }))
+                .await
+                .unwrap();
+            store
+                .upsert("f", vec![fact_point("b", tag, "switched to Nike", true)])
+                .await
+                .unwrap();
+            store
+                .set_payload("f", &["b".into()], json!({ "is_latest": false }))
+                .await
+                .unwrap();
+            store
+                .upsert("f", vec![fact_point("c", tag, "now prefers Puma", true)])
+                .await
+                .unwrap();
+
+            let filter = tagged_filter(Some(active_facts_filter(None, now)), tag);
+            let active = store.scroll_all("f", Some(filter), 100).await.unwrap();
+            let served: Vec<&str> = active
+                .iter()
+                .filter_map(|p| p["payload"]["fact"].as_str())
+                .collect();
+            assert_eq!(
+                served,
+                vec!["now prefers Puma"],
+                "chain must serve only the latest value"
+            );
+        });
+    }
+
+    /// Permission isolation: two tenants with conflicting facts; each tenant's
+    /// active scroll returns only its own — the store-level proof that a
+    /// namespace filter never leaks another tenant's memory.
+    #[test]
+    fn active_scroll_is_namespace_isolated() {
+        use crate::providers::mock::MemStore;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = MemStore::new();
+            let now = 1_000_000i64;
+            store
+                .upsert("f", vec![fact_point("a1", "alice", "uses Slack", true)])
+                .await
+                .unwrap();
+            store
+                .upsert("f", vec![fact_point("b1", "bob", "uses Teams", true)])
+                .await
+                .unwrap();
+
+            for (tag, own, other) in [
+                ("alice", "uses Slack", "uses Teams"),
+                ("bob", "uses Teams", "uses Slack"),
+            ] {
+                let filter = tagged_filter(Some(active_facts_filter(None, now)), tag);
+                let got: Vec<String> = store
+                    .scroll_all("f", Some(filter), 100)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter_map(|p| p["payload"]["fact"].as_str().map(String::from))
+                    .collect();
+                assert!(
+                    got.iter().any(|f| f == own),
+                    "{tag} should see its own fact"
+                );
+                assert!(
+                    !got.iter().any(|f| f == other),
+                    "LEAK: {tag} saw another tenant's fact"
+                );
+            }
+        });
+    }
+
     #[test]
     fn embed_input_prepends_context_blurb() {
         assert_eq!(
