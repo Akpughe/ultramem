@@ -2104,6 +2104,73 @@ mod tests {
             .any(|c| c["key"] == "needs_review" && c["match"]["value"] == true));
     }
 
+    /// forget_is_total: deleting a document removes it from chunks, facts, AND
+    /// graph edges within its namespace, while another tenant's data is untouched.
+    /// Runs offline against the in-memory mock store (no Qdrant/providers).
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn forget_is_total_across_surfaces() {
+        use crate::providers::mock::MemStore;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = EngineCfg::default();
+            cfg.chunks_collection = "c".into();
+            cfg.facts_collection = "f".into();
+            cfg.graph_collection = "g".into();
+            cfg.temporal_graph = true; // so the delete cascades to edges
+            let store = std::sync::Arc::new(MemStore::new());
+            let engine = MemoryEngine::new(cfg).with_store(store.clone());
+
+            let (tag, doc) = ("tenant_x", "doc-1");
+            store
+                .upsert(
+                    "c",
+                    vec![json!({"id":"c1","vector":[0.0],"payload":{"doc_id":doc,"container_tag":tag,"content":"a chunk"}})],
+                )
+                .await
+                .unwrap();
+            store
+                .upsert(
+                    "f",
+                    vec![
+                        json!({"id":"f1","vector":[0.0],"payload":{"doc_id":doc,"container_tag":tag,"fact":"the user loves X","is_latest":true}}),
+                        // Another tenant's fact — must survive the delete.
+                        json!({"id":"f2","vector":[0.0],"payload":{"doc_id":"doc-2","container_tag":"tenant_y","fact":"other","is_latest":true}}),
+                    ],
+                )
+                .await
+                .unwrap();
+            store
+                .upsert(
+                    "g",
+                    vec![json!({"id":"g1","vector":[0.0],"payload":{"doc_id":doc,"container_tag":tag,"subject":"user","is_latest":true}})],
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(store.count("c"), 1);
+            assert_eq!(store.count("f"), 2);
+            assert_eq!(store.count("g"), 1);
+
+            let deleted = engine.delete_document_tagged(doc, tag).await.unwrap();
+            assert!(deleted, "existing document should report deleted");
+
+            // Gone from every surface for this doc…
+            assert_eq!(store.count("c"), 0, "chunks survived the delete");
+            assert_eq!(store.count("g"), 0, "graph edges survived the delete");
+            let doc1_facts =
+                store.count_matching("f", &json!({ "must": [{ "key": "doc_id", "match": { "value": doc } }] }));
+            assert_eq!(doc1_facts, 0, "facts survived the delete");
+            // …but the other tenant's fact is untouched.
+            assert_eq!(store.count("f"), 1, "cross-tenant fact wrongly deleted");
+
+            // And deleting a doc that isn't in the caller's namespace is a no-op.
+            let again = engine.delete_document_tagged("doc-2", tag).await.unwrap();
+            assert!(!again, "cross-namespace delete must report not-found");
+            assert_eq!(store.count("f"), 1);
+        });
+    }
+
     #[test]
     fn embed_input_prepends_context_blurb() {
         assert_eq!(
