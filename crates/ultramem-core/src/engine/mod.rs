@@ -904,7 +904,11 @@ impl MemoryEngine {
             superseded.dedup();
             if let Err(e) = self
                 .store
-                .set_payload(&cfg.graph_collection, &superseded, json!({ "is_latest": false }))
+                .set_payload(
+                    &cfg.graph_collection,
+                    &superseded,
+                    json!({ "is_latest": false }),
+                )
                 .await
             {
                 eprintln!(
@@ -1587,6 +1591,10 @@ impl MemoryEngine {
     }
 
     /// Remove a document's chunks and facts from both collections.
+    ///
+    /// Unscoped — deletes by `doc_id` across every namespace. Prefer
+    /// [`Self::delete_document_tagged`] on any multi-tenant surface; this remains
+    /// for embedded single-tenant use and internal tests.
     pub async fn delete_document(&self, doc_id: &str) -> Result<(), String> {
         let cfg = self.cfg();
         let (a, b) = tokio::join!(
@@ -1595,6 +1603,35 @@ impl MemoryEngine {
         );
         a?;
         b
+    }
+
+    /// Delete a document only if it lives in `tag`'s namespace (SS-2). Returns
+    /// `Ok(false)` when no point with that `doc_id` exists in the tag (the caller
+    /// maps that to `404`) so a document in another tenant is never touched and
+    /// its existence is not disclosed. `Ok(true)` when something was deleted.
+    pub async fn delete_document_tagged(&self, doc_id: &str, tag: &str) -> Result<bool, String> {
+        let cfg = self.cfg();
+        let filter = doc_delete_filter(doc_id, tag);
+        // Existence within the caller's namespace (a doc always has chunks; check
+        // facts too so a chunkless-but-facted doc still resolves).
+        let (c, f) = tokio::join!(
+            self.store
+                .scroll_all(&cfg.chunks_collection, Some(filter.clone()), 1),
+            self.store
+                .scroll_all(&cfg.facts_collection, Some(filter.clone()), 1),
+        );
+        let exists = !c.unwrap_or_default().is_empty() || !f.unwrap_or_default().is_empty();
+        if !exists {
+            return Ok(false);
+        }
+        let (a, b) = tokio::join!(
+            self.store
+                .delete_by_filter(&cfg.chunks_collection, filter.clone()),
+            self.store.delete_by_filter(&cfg.facts_collection, filter),
+        );
+        a?;
+        b?;
+        Ok(true)
     }
 }
 
@@ -1645,6 +1682,16 @@ fn tagged_filter(base: Option<Value>, tag: &str) -> Value {
         }
     }
     f
+}
+
+/// Filter that matches exactly one document's points *within a namespace*: the
+/// `doc_id` constraint plus the tag scope from [`tagged_filter`]. Used by
+/// [`MemoryEngine::delete_document_tagged`] so a delete can never reach across
+/// tenants. For the default tag this also matches legacy (untagged) points, the
+/// same rule reads use.
+fn doc_delete_filter(doc_id: &str, tag: &str) -> Value {
+    let base = json!({ "must": [ { "key": "doc_id", "match": { "value": doc_id } } ] });
+    tagged_filter(Some(base), tag)
 }
 
 /// Wrap a base filter (or none) so it also excludes memories that are no longer
@@ -1945,6 +1992,33 @@ mod tests {
     }
 
     #[test]
+    fn doc_delete_filter_is_tag_scoped() {
+        // SS-2: a scoped delete must constrain BOTH the doc_id and the namespace,
+        // so it can never remove another tenant's document.
+        let f = doc_delete_filter("doc-abc", "tenant_42");
+        let must = f["must"].as_array().unwrap();
+        assert!(must
+            .iter()
+            .any(|c| c["key"] == "doc_id" && c["match"]["value"] == "doc-abc"));
+        assert!(must
+            .iter()
+            .any(|c| c["key"] == "container_tag" && c["match"]["value"] == "tenant_42"));
+    }
+
+    #[test]
+    fn doc_delete_filter_default_tag_keeps_doc_and_legacy_scope() {
+        // Default namespace: doc_id is a hard `must`; the tag/legacy match rides in
+        // `should` (default OR untagged), exactly as reads scope it.
+        let f = doc_delete_filter("doc-xyz", DEFAULT_TAG);
+        assert!(f["must"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["key"] == "doc_id" && c["match"]["value"] == "doc-xyz"));
+        assert!(f["should"].as_array().unwrap().len() == 2);
+    }
+
+    #[test]
     fn embed_input_prepends_context_blurb() {
         assert_eq!(
             embed_input("newton-profile.pdf", Some("Newton's Q3 review."), "body"),
@@ -2116,6 +2190,8 @@ mod pipeline_tests {
             let joined = facts.join(" | ").to_lowercase();
             eprintln!("latest facts for shoe query: {facts:#?}");
             assert!(joined.contains("puma"), "current brand (Puma) missing from latest facts");
+            // Absence, not just presence: the superseded brand must not be served.
+            assert!(!joined.contains("adidas"), "superseded brand (Adidas) still served in latest facts");
 
             let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.chunks_collection).await;
             let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.facts_collection).await;
@@ -2190,6 +2266,18 @@ mod pipeline_tests {
             // Profiles are per-namespace too.
             let ap = engine.profile_tagged("tenant_alice").await.as_prompt_block().to_lowercase();
             assert!(!ap.contains("teams"), "LEAK: alice's profile mentions Bob's Teams");
+
+            // SS-2: delete is namespace-scoped. Find one of Bob's documents.
+            let bob_docs = engine.list_document_ids("tenant_bob", None, 10).await.expect("bob docs");
+            let bob_id = bob_docs.first().map(|(id, ..)| id.clone()).expect("bob has a document");
+            // Alice cannot delete Bob's document — wrong namespace → no-op (404).
+            let cross = engine.delete_document_tagged(&bob_id, "tenant_alice").await.expect("cross delete");
+            assert!(!cross, "LEAK: alice deleted a document she does not own");
+            let (_r, b2) = engine.retrieve_tagged("tenant_bob", "what chat tool does the company use", None, 8).await.expect("bob retrieve 2");
+            assert!(b2.join(" ").to_lowercase().contains("teams"), "cross-tenant delete wrongly removed Bob's data");
+            // Bob can delete his own document.
+            let own = engine.delete_document_tagged(&bob_id, "tenant_bob").await.expect("own delete");
+            assert!(own, "bob could not delete his own document");
 
             let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.chunks_collection).await;
             let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.facts_collection).await;

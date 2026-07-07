@@ -6,20 +6,33 @@ Design goal: mirror SuperMemory's surface so it's a drop-in mental model, backed
 
 ## Auth & namespaces
 
-- `Authorization: Bearer <key>` on every endpoint. Keys map to tenants/projects (configurable; simplest v1 = one static key from env).
-- `container_tag` in the body/query selects the memory pool. Omit → default pool. The server should derive/enforce the tag from the API key in true multi-tenant mode, so a client can't read another tenant's namespace (mirror the CSRF/verification discipline already in Recally's auth).
+- `Authorization: Bearer <key>` on every protected endpoint. A missing/unknown key → `401`.
+- **Credentials are bound to namespaces (enforced server-side).** Each key resolves to a
+  *tag policy*; a request may only act on a `container_tag` the credential is allowed to use.
+  Naming a tag outside that set → `403`. This closes the earlier hole where any key-holder
+  could read/write/delete any tenant by changing the `container_tag` string.
+  - `ULTRAMEM_TENANTS="keyA=tenant_a,shared; keyB=*"` — bind keys to tags. A tag of `*`
+    means "any tag" (a trusted backend that manages its own per-user tags).
+  - `ULTRAMEM_API_KEY=<key>` — a single key; treated as wildcard (`*`) for backward
+    compatibility with the single-key/many-tags quickstart. Prefer `ULTRAMEM_TENANTS` to
+    bind it to specific tags.
+  - `ULTRAMEM_DEV=1` — run **unauthenticated** with no keys (local development only). With
+    no keys and no `ULTRAMEM_DEV=1`, the server refuses to start.
+- `container_tag` in the body/query selects the memory pool *within the credential's allowed
+  set*. Omit → the credential's default tag.
+- This is an intentional seam: a later version replaces the env-based policy with JWT claims
+  or a tenant table without changing the endpoints.
 
 ## Endpoints
 
 ### `POST /v1/memories` — ingest
 The endpoint dispatches on `Content-Type`. Provide exactly one source of content.
 
-**JSON** (`application/json`) — one of `content`, `url`, or `file_path`:
+**JSON** (`application/json`) — one of `content` or `url`:
 ```jsonc
 {
   "content": "string",           // raw text/markdown, OR
-  "url": "https://…",            // fetch + clean the page (Jina Reader), OR
-  "file_path": "/path/on/server",// a file on the SERVER's filesystem (local/embedded use)
+  "url": "https://…",            // fetch + clean the page (Jina Reader)
   "title": "string?",
   "source": "clipboard|browser|file|meeting|api|web",
   "reference": "string?",        // canonical id/url
@@ -27,6 +40,11 @@ The endpoint dispatches on `Content-Type`. Provide exactly one source of content
   "captured_at": 1760000000       // unix; default now
 }
 ```
+
+> **`file_path` is rejected over the network** (returns `400`) — reading an arbitrary
+> server-side path is a file-disclosure risk. To ingest a file from a client, use the
+> multipart upload below. Local file ingestion remains available through the embedded Rust
+> engine API (`MemoryEngine::add_document`), not the HTTP API.
 
 **File upload** (`multipart/form-data`) — to send a file's bytes from a client.
 A `file` part (PDF/image/Office/text — OCR'd or text-extracted server-side via
@@ -39,18 +57,20 @@ Upload size cap: 32 MB.
 
 → `{ "document_id": "uuid", "status": "done" }` (any mode). Returning `done` means chunks are searchable; fact distillation + lifecycle run inline (non-fatal). Maps to `MemoryEngine::add_document` (text/file) / `add_url` (url). Distillation only runs for content longer than ~280 chars.
 
-### `POST /v1/search` — hybrid retrieve
+### `POST /v1/search` — retrieve
 ```jsonc
 {
   "query": "string",
   "container_tag": "string?",
-  "limit": 8,
-  "source": "browser?",          // optional filter
-  "after": 1760000000, "before": 1760600000,
-  "rerank": true,                 // default true
-  "mode": "hybrid|dense"          // hybrid = dense+sparse RRF (needs hybrid collection)
+  "limit": 8
 }
 ```
+
+> **Implemented fields today are `query`, `container_tag`, `limit`.** The planner still
+> resolves source/date/list intent *from the query text*, but the following request-level
+> filters are **planned, not yet wired** into `SearchBody`: `source`, `after`, `before`,
+> `rerank`, `mode` (dense vs. hybrid). Sending them is accepted but ignored.
+
 →
 ```jsonc
 {
@@ -76,13 +96,20 @@ Complete newest-first list (not similarity top-K) for "what did I do this week".
 ```jsonc
 { "container_tag": "string?", "mode": "tags|latest|facts" }
 ```
-→ `{ "job_id": "…", "total": 0 }` (async). Reuses stored chunk text. Maps to `claim_legacy_into_tag` / `backfill_facts_latest` / `reindex_memory_graph`. Progress via SSE `GET /v1/jobs/:id/stream` or polling `GET /v1/jobs/:id`.
+→ `{ "ok": true, "mode": "…" }`, or for `mode=facts` `{ "ok": true, "mode": "facts", "total": N, "status": "running" }`. Reuses stored chunk text. Maps to `claim_legacy_into_tag` / `backfill_facts_latest` / `reindex_doc_facts`.
 
-### `DELETE /v1/memories/:document_id` — forget
-Removes chunks + facts. Maps to `delete_document`.
+> **Planned, not implemented:** a persisted job record and progress endpoints
+> (`GET /v1/jobs/:id`, SSE `GET /v1/jobs/:id/stream`). Today `mode=facts` runs as a
+> detached background task with no status/cancellation surface.
+
+### `DELETE /v1/memories/:document_id?container_tag=…` — forget
+Removes the document's chunks + facts **within the caller's namespace only**. A document in
+another tenant's namespace returns `404` (and is not touched). A `container_tag` the
+credential doesn't own returns `403`. Maps to `delete_document_tagged`.
 
 ### `GET /v1/health`
-→ `{ "ok": true, "qdrant": true, "embeddings": true }`. Maps to `MemoryEngine::health`.
+→ `{ "ok": true }` (no auth). Maps to `MemoryEngine::health` (Qdrant reachability + a
+provider-key presence check).
 
 ## Provider config (env)
 `QDRANT_URL`, `QDRANT_API_KEY`, `JINA_API_KEY`, `MISTRAL_API_KEY`, and the LLM provider keys (Groq/OpenAI/Anthropic/Ollama via `llm.rs`). Once the provider traits land (ROADMAP Phase 3) these become swappable per-deployment.

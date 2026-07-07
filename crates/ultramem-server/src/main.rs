@@ -13,23 +13,38 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use ultramem_core::{EngineCfg, IngestDoc, MemoryEngine, DEFAULT_TAG};
+use ultramem_core::{EngineCfg, IngestDoc, MemoryEngine};
+
+mod tenant;
+use tenant::{AuthConfig, TenantCtx};
 
 struct AppState {
     engine: MemoryEngine,
-    api_key: String,
+    auth: AuthConfig,
 }
 
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
-    let api_key = std::env::var("ULTRAMEM_API_KEY").unwrap_or_default();
-    if api_key.is_empty() {
-        eprintln!("[ultramem] WARNING: ULTRAMEM_API_KEY is empty — the API is UNAUTHENTICATED.");
+    // NB: not named `auth` — that would shadow the `auth` middleware fn at the
+    // `from_fn_with_state(state, auth)` call site below.
+    let auth_cfg = AuthConfig::from_env();
+    if auth_cfg.is_misconfigured() {
+        eprintln!(
+            "[ultramem] FATAL: no API credentials configured. Set ULTRAMEM_API_KEY (or \
+             ULTRAMEM_TENANTS=\"key=tag1,tag2\"), or set ULTRAMEM_DEV=1 to run unauthenticated \
+             for local development only."
+        );
+        std::process::exit(1);
+    }
+    if auth_cfg.is_open() {
+        eprintln!(
+            "[ultramem] WARNING: ULTRAMEM_DEV=1 and no keys — the API is UNAUTHENTICATED (dev only)."
+        );
     }
     let engine = MemoryEngine::new(EngineCfg::from_env());
     // Qdrant may still be starting (e.g. `docker compose up` boots both at once),
@@ -50,7 +65,10 @@ async fn main() {
     if !ensured {
         eprintln!("[ultramem] WARNING: could not ensure Qdrant collections after retries — writes will fail until Qdrant is reachable.");
     }
-    let state = Arc::new(AppState { engine, api_key });
+    let state = Arc::new(AppState {
+        engine,
+        auth: auth_cfg,
+    });
 
     let protected = Router::new()
         .route(
@@ -82,32 +100,35 @@ async fn main() {
     axum::serve(listener, app).await.expect("serve");
 }
 
-/// Bearer-key gate. When `ULTRAMEM_API_KEY` is set, every protected request must
-/// present `Authorization: Bearer <key>`.
+/// Bearer-key gate. Resolves the credential to a [`TenantCtx`] (which namespaces
+/// it may touch) and injects it for handlers. In dev/open mode every request gets
+/// an unrestricted context. A missing/unknown key is `401`.
 async fn auth(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if state.api_key.is_empty() {
-        return next.run(req).await; // unauthenticated mode (dev only)
-    }
-    let ok = headers
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .map(|t| t == state.api_key)
-        .unwrap_or(false);
-    if ok {
-        next.run(req).await
+    let ctx = if state.auth.is_open() {
+        TenantCtx::any() // unauthenticated mode (dev only)
     } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "invalid or missing API key" })),
-        )
-            .into_response()
-    }
+        let bearer = headers
+            .get("authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "));
+        match state.auth.resolve(bearer) {
+            Some(ctx) => ctx,
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "invalid or missing API key" })),
+                )
+                    .into_response()
+            }
+        }
+    };
+    req.extensions_mut().insert(ctx);
+    next.run(req).await
 }
 
 fn err(e: String) -> Response {
@@ -117,10 +138,25 @@ fn err(e: String) -> Response {
     )
         .into_response()
 }
-fn tag_or_default(t: &Option<String>) -> String {
-    t.clone()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_TAG.to_string())
+
+/// The requested `container_tag` is outside the credential's allowed set.
+fn forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "container_tag not permitted for this credential" })),
+    )
+        .into_response()
+}
+
+fn not_found() -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))).into_response()
+}
+
+/// Resolve the request's tag against the credential. `Err(())` means "denied";
+/// call sites turn that into [`forbidden`] (kept a ZST error so the `Result`
+/// doesn't carry a large `Response`).
+fn resolve_tag(ctx: &TenantCtx, requested: &Option<String>) -> Result<String, ()> {
+    ctx.resolve_tag(requested).map_err(|_| ())
 }
 
 // ── health ──────────────────────────────────────────────────────────────────
@@ -139,16 +175,33 @@ struct AddBody {
     reference: Option<String>,
     container_tag: Option<String>,
     captured_at: Option<i64>,
-    /// Path to a file **on the server's filesystem** (for local/embedded use).
-    /// To upload a file from a client, use `multipart/form-data` instead.
-    file_path: Option<String>,
+    /// Rejected over the network (SS-3): reading an arbitrary server path is a
+    /// file-disclosure risk. Present only so the server can return a clear `400`;
+    /// local file ingestion stays available through the embedded Rust engine API.
+    file_path: Option<Value>,
+}
+
+/// Reject a JSON ingest that tries to name a server-side `file_path` (SS-3).
+fn check_add_body(b: &AddBody) -> Result<(), String> {
+    if b.file_path.is_some() {
+        return Err(
+            "`file_path` is not accepted over the network; upload the file via multipart/form-data \
+             instead"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// `POST /v1/memories` — ingest. Dispatches on `Content-Type`:
-/// - `application/json`: `content` (text), `url` (fetch+clean), or server-side `file_path`.
+/// - `application/json`: `content` (text) or `url` (fetch+clean).
 /// - `multipart/form-data`: a `file` part (PDF/image/text → OCR/extraction) plus
 ///   optional `title`/`source`/`reference`/`container_tag`/`captured_at` fields.
-async fn add_memory(State(state): State<Arc<AppState>>, req: Request) -> Response {
+async fn add_memory(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    req: Request,
+) -> Response {
     let is_multipart = req
         .headers()
         .get(CONTENT_TYPE)
@@ -157,7 +210,7 @@ async fn add_memory(State(state): State<Arc<AppState>>, req: Request) -> Respons
         .unwrap_or(false);
     if is_multipart {
         match Multipart::from_request(req, &state).await {
-            Ok(mp) => ingest_multipart(&state, mp).await,
+            Ok(mp) => ingest_multipart(&state, &ctx, mp).await,
             Err(e) => bad_request(format!("invalid multipart: {e}")),
         }
     } else {
@@ -166,7 +219,7 @@ async fn add_memory(State(state): State<Arc<AppState>>, req: Request) -> Respons
             Err(e) => return bad_request(format!("could not read body: {e}")),
         };
         match serde_json::from_slice::<AddBody>(&bytes) {
-            Ok(b) => ingest_json(&state, b).await,
+            Ok(b) => ingest_json(&state, &ctx, b).await,
             Err(e) => bad_request(format!("invalid JSON: {e}")),
         }
     }
@@ -179,9 +232,15 @@ fn bad_request(msg: String) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
 }
 
-async fn ingest_json(state: &Arc<AppState>, b: AddBody) -> Response {
+async fn ingest_json(state: &Arc<AppState>, ctx: &TenantCtx, b: AddBody) -> Response {
+    if let Err(m) = check_add_body(&b) {
+        return bad_request(m);
+    }
+    let tag = match resolve_tag(ctx, &b.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
     let now = chrono::Utc::now().timestamp();
-    let tag = tag_or_default(&b.container_tag);
     let captured_at = b.captured_at.unwrap_or(now);
     // URL ingestion: fetch + clean via Jina Reader, then the normal pipeline.
     if let Some(url) = b.url.filter(|u| !u.is_empty()) {
@@ -197,7 +256,8 @@ async fn ingest_json(state: &Arc<AppState>, b: AddBody) -> Response {
         reference: b.reference.unwrap_or_default(),
         app: String::new(),
         captured_at,
-        file_path: b.file_path,
+        // Never set from the network — the request path can't name a server file.
+        file_path: None,
         container_tag: tag,
     };
     match state.engine.add_document(&doc).await {
@@ -206,7 +266,7 @@ async fn ingest_json(state: &Arc<AppState>, b: AddBody) -> Response {
     }
 }
 
-async fn ingest_multipart(state: &Arc<AppState>, mut mp: Multipart) -> Response {
+async fn ingest_multipart(state: &Arc<AppState>, ctx: &TenantCtx, mut mp: Multipart) -> Response {
     let mut file_bytes: Option<Bytes> = None;
     let mut filename = String::new();
     let (mut title, mut source, mut reference, mut container_tag) = (
@@ -245,6 +305,10 @@ async fn ingest_multipart(state: &Arc<AppState>, mut mp: Multipart) -> Response 
     let Some(bytes) = file_bytes else {
         return bad_request("multipart upload requires a 'file' part".into());
     };
+    let tag = match resolve_tag(ctx, &container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
 
     // Buffer to a temp file preserving the extension (the engine routes OCR vs
     // text-extraction by it), ingest via the normal file pipeline, then clean up.
@@ -265,8 +329,9 @@ async fn ingest_multipart(state: &Arc<AppState>, mut mp: Multipart) -> Response 
         reference: reference.unwrap_or_else(|| base.clone()),
         app: String::new(),
         captured_at: captured_at.unwrap_or(now),
+        // Server-generated temp path, not client-supplied — safe.
         file_path: Some(tmp.to_string_lossy().into_owned()),
-        container_tag: tag_or_default(&container_tag),
+        container_tag: tag,
     };
     let result = state.engine.add_document(&doc).await;
     let _ = tokio::fs::remove_file(&tmp).await; // best-effort cleanup
@@ -276,9 +341,22 @@ async fn ingest_multipart(state: &Arc<AppState>, mut mp: Multipart) -> Response 
     }
 }
 
-async fn delete_memory(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    match state.engine.delete_document(&id).await {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
+/// `DELETE /v1/memories/:id` — scoped to the caller's namespace (SS-2). A
+/// document outside the caller's tag is `404` (not deleted, not disclosed); a
+/// `container_tag` the credential doesn't own is `403`.
+async fn delete_memory(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Query(q): Query<TagQuery>,
+    Path(id): Path<String>,
+) -> Response {
+    let tag = match resolve_tag(&ctx, &q.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
+    match state.engine.delete_document_tagged(&id, &tag).await {
+        Ok(true) => Json(json!({ "ok": true })).into_response(),
+        Ok(false) => not_found(),
         Err(e) => err(e),
     }
 }
@@ -291,8 +369,15 @@ struct SearchBody {
     limit: Option<usize>,
 }
 
-async fn search(State(state): State<Arc<AppState>>, Json(b): Json<SearchBody>) -> Response {
-    let tag = tag_or_default(&b.container_tag);
+async fn search(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Json(b): Json<SearchBody>,
+) -> Response {
+    let tag = match resolve_tag(&ctx, &b.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
     let limit = b.limit.unwrap_or(8).clamp(1, 50);
     match state
         .engine
@@ -312,11 +397,16 @@ struct TagQuery {
     container_tag: Option<String>,
 }
 
-async fn profile(State(state): State<Arc<AppState>>, Query(q): Query<TagQuery>) -> Response {
-    let p = state
-        .engine
-        .profile_tagged(&tag_or_default(&q.container_tag))
-        .await;
+async fn profile(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Query(q): Query<TagQuery>,
+) -> Response {
+    let tag = match resolve_tag(&ctx, &q.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
+    let p = state.engine.profile_tagged(&tag).await;
     Json(json!({ "static": p.static_text, "dynamic": p.dynamic_text })).into_response()
 }
 
@@ -328,8 +418,15 @@ struct TimelineQuery {
     limit: Option<usize>,
 }
 
-async fn timeline(State(state): State<Arc<AppState>>, Query(q): Query<TimelineQuery>) -> Response {
-    let tag = tag_or_default(&q.container_tag);
+async fn timeline(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Query(q): Query<TimelineQuery>,
+) -> Response {
+    let tag = match resolve_tag(&ctx, &q.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
     let limit = q.limit.unwrap_or(60).clamp(1, 500);
     match state.engine.list_document_ids(&tag, q.before, limit).await {
         Ok(rows) => {
@@ -352,8 +449,15 @@ struct ReindexBody {
     mode: Option<String>, // "tags" | "latest" | "facts"
 }
 
-async fn reindex(State(state): State<Arc<AppState>>, Json(b): Json<ReindexBody>) -> Response {
-    let tag = tag_or_default(&b.container_tag);
+async fn reindex(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Json(b): Json<ReindexBody>,
+) -> Response {
+    let tag = match resolve_tag(&ctx, &b.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
     match b.mode.as_deref().unwrap_or("latest") {
         "tags" => match state.engine.claim_legacy_into_tag(&tag).await {
             Ok(()) => {
@@ -396,5 +500,34 @@ async fn reindex(State(state): State<Arc<AppState>>, Json(b): Json<ReindexBody>)
             Json(json!({ "error": format!("unknown mode '{other}'") })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body(file_path: Option<Value>) -> AddBody {
+        AddBody {
+            content: Some("hello".into()),
+            url: None,
+            title: None,
+            source: None,
+            reference: None,
+            container_tag: None,
+            captured_at: None,
+            file_path,
+        }
+    }
+
+    #[test]
+    fn json_ingest_rejects_file_path() {
+        // SS-3: a network request must not be able to name a server-side path.
+        assert!(check_add_body(&body(Some(json!("/etc/passwd")))).is_err());
+    }
+
+    #[test]
+    fn json_ingest_allows_normal_content() {
+        assert!(check_add_body(&body(None)).is_ok());
     }
 }
