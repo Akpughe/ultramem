@@ -304,11 +304,7 @@ async fn main() {
             .iter()
             .filter_map(|d| d.metadata.as_ref().and_then(|m| m["reference"].as_str()))
             .collect();
-        let retrieved_gold = inst.answer_session_ids.is_empty()
-            || inst
-                .answer_session_ids
-                .iter()
-                .any(|id| retrieved_refs.contains(id.as_str()));
+        let retrieved_gold = all_gold_retrieved(&inst.answer_session_ids, &retrieved_refs);
 
         let facts_block = |label: &str| {
             if memories.is_empty() {
@@ -892,9 +888,43 @@ fn judge_prompt(qtype: &str, question: &str, answer: &str, response: &str) -> St
     }
 }
 
+/// Retrieval completeness for a LongMemEval instance: were ALL gold-evidence
+/// sessions retrieved? Uses ALL, not ANY — the any-based version scored a
+/// multi-session question as "gold retrieved" when only one of several required
+/// sessions surfaced, overstating retrieval and masking multi-hop misses (the
+/// broken metric the roadmap flagged). An abstention instance (no gold sessions)
+/// is trivially complete.
+fn all_gold_retrieved(
+    gold_session_ids: &[String],
+    retrieved_refs: &std::collections::HashSet<&str>,
+) -> bool {
+    gold_session_ids.is_empty()
+        || gold_session_ids
+            .iter()
+            .all(|id| retrieved_refs.contains(id.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gold_retrieved_requires_all_sessions_not_any() {
+        let refs: std::collections::HashSet<&str> = ["s1", "s2"].into_iter().collect();
+        // All gold sessions present → complete.
+        assert!(all_gold_retrieved(
+            &["s1".to_string(), "s2".to_string()],
+            &refs
+        ));
+        // One of two gold sessions missing → NOT complete (the old .any() bug
+        // would have called this retrieved).
+        assert!(!all_gold_retrieved(
+            &["s1".to_string(), "s3".to_string()],
+            &refs
+        ));
+        // Abstention (no gold sessions) → trivially complete.
+        assert!(all_gold_retrieved(&[], &refs));
+    }
 
     #[test]
     fn count_extraction_is_robust() {

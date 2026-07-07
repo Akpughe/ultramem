@@ -29,8 +29,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # Unit + doc tests only. The live pipeline tests are gated behind
-      # ULTRAMEM_PIPELINE_TESTS=1 and require Qdrant + provider keys, so they are
-      # intentionally NOT run here — CI stays hermetic.
-      - name: Test
-        run: cargo test --workspace
+      # Unit tests across all targets (lib, bins, and the eval-harness examples,
+      # so the harness's own parser/metric tests gate too) plus doc tests. The
+      # live pipeline tests are gated behind ULTRAMEM_PIPELINE_TESTS=1 and require
+      # Qdrant + provider keys, so they are intentionally NOT run here — CI stays
+      # hermetic.
+      - name: Test (all targets)
+        run: cargo test --workspace --all-targets
+      - name: Doc tests
+        run: cargo test --workspace --doc
