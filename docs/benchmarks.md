@@ -69,7 +69,23 @@ Measured against the committed 24-doc corpus, default engine config (Jina embedd
 | tokens injected (mean) | 176 |
 | MemScore | 97/100 |
 
-> **Read this honestly.** This corpus is 24 documents on *deliberately distinct* topics (Postgres pooling, espresso dial-in, marathon training, JWT auth, …), so a working retriever *should* rank every target #1 — perfect H@1 here demonstrates the pipeline is sound and the result is reproducible on your machine, **not** that retrieval is "solved." A real difficulty signal needs near-duplicate distractors; for that, point the harness at your own indexed documents (omit the collection overrides) and run `bench build` / `bench`, or grow the corpus.
+> **Read this honestly.** This corpus is 24 documents on *deliberately distinct* topics (Postgres pooling, espresso dial-in, marathon training, JWT auth, …), so a working retriever *should* rank every target #1 — perfect H@1 here demonstrates the pipeline is sound and the result is reproducible on your machine, **not** that retrieval is "solved." A real difficulty signal needs near-duplicate distractors; see the hard corpus below.
+
+### Hard distractor corpus (the real difficulty signal)
+
+`eval/corpus_hard.json` is 12 documents in **4 clusters of near-duplicates** — three PgBouncer/pooling variants, three JWT-token docs, three marathon-training docs, three Kubernetes-probe docs. Within a cluster the documents are topically almost identical, so ranking the *right* one #1 requires real discrimination, not just topic match. Its golden set (`eval/hard_gold.json`) is **committed and deterministic** — hand-authored discriminating queries keyed by document **title**, so numbers reproduce byte-for-byte across machines with no LLM-generated golden drift (the bench matches a target by `doc_id` **or** title, so a stable committed golden needs no stable ingest ids).
+
+```bash
+export ULTRAMEM_CHUNKS_COLLECTION=ultramem_hard_chunks
+export ULTRAMEM_FACTS_COLLECTION=ultramem_hard_facts
+export ULTRAMEM_GOLDEN=eval/hard_gold.json
+
+cargo run -p ultramem-core --example probe -- seed eval/corpus_hard.json   # ingest the 12 near-dup docs
+cargo run -p ultramem-core --example probe -- bench                        # score vs the committed golden
+cargo run -p ultramem-core --example probe -- drop                         # clean up
+```
+
+Expect H@1 **below** the demo corpus's perfect score — that gap is the point. Track MRR here (not the demo's 1.000) as the honest retrieval-quality number, and watch it move as the retriever changes.
 >
 > Latency is dominated by per-query provider round-trips (planner LLM + embedding + reranker, all remote HTTP); it's network-bound and varies run to run. `tokens injected` (176) is the small, precise context the answer model would receive — the efficiency half of MemScore.
 

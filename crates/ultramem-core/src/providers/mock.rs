@@ -13,7 +13,59 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::VectorStore;
+use super::{Llm, VectorStore};
+use crate::llm::ResolvedModel;
+
+/// An `Llm` that records every prompt it receives and returns a canned response.
+/// Lets a test assert what actually reached the model — e.g. that ingested
+/// content was wrapped in injection-guard delimiters before distillation.
+pub struct CapturingLlm {
+    reply: String,
+    pub calls: Mutex<Vec<(String, String)>>, // (system, user)
+}
+
+impl CapturingLlm {
+    pub fn new(reply: impl Into<String>) -> Self {
+        Self {
+            reply: reply.into(),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+    /// The (system, user) of the most recent chat call.
+    pub fn last(&self) -> (String, String) {
+        self.calls
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+#[async_trait]
+impl Llm for CapturingLlm {
+    async fn chat(
+        &self,
+        _m: &ResolvedModel,
+        system: &str,
+        user: &str,
+        _temperature: f64,
+    ) -> Result<String, String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((system.to_string(), user.to_string()));
+        Ok(self.reply.clone())
+    }
+    async fn complete(
+        &self,
+        _m: &ResolvedModel,
+        _messages: Value,
+        _temperature: f64,
+    ) -> Result<String, String> {
+        Ok(self.reply.clone())
+    }
+}
 
 /// A collection of points, each shaped `{ "id", "vector", "payload" }`.
 #[derive(Default)]

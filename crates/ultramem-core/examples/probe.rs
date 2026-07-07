@@ -171,6 +171,25 @@ async fn run_memtest(cfg: &EngineCfg) {
             must_absent: vec!["adidas"],
             expect_superseded: true,
         },
+        MemScenario {
+            name: "contradiction chain (A to B to C)",
+            docs: vec![
+                "Footwear note for the record. The user's preferred running shoe brand is Adidas. \
+                 They train exclusively in Adidas, own several pairs of Adidas Ultraboost, and \
+                 recommend Adidas to everyone at their running club without a single exception.",
+                "Footwear update. The user has switched away from Adidas and now runs only in Nike. \
+                 Nike is now their current and preferred running shoe brand; they replaced their \
+                 whole rotation with Nike Pegasus and no longer buy Adidas at all going forward.",
+                "Another footwear update, the latest one. The user has now moved on from Nike as well \
+                 and switched entirely to Puma. Puma is now their current and preferred running shoe \
+                 brand; they replaced the Nike rotation with Puma Deviate and no longer buy Nike.",
+            ],
+            query: "what running shoe brand does the user prefer now",
+            must_contain: vec!["puma"],
+            // Every earlier link in the chain must be gone, not just the first.
+            must_absent: vec!["adidas", "nike"],
+            expect_superseded: true,
+        },
     ];
 
     let http = reqwest::Client::new();
@@ -407,9 +426,15 @@ async fn run_bench(engine: &MemoryEngine, cfg: &EngineCfg, build: bool) {
         let (docs, facts) = engine.retrieve(&item.query, 10).await.unwrap_or_default();
         latencies_ms.push(t0.elapsed().as_millis());
 
+        // Match the target by doc_id (generated goldens) OR by title, so a
+        // COMMITTED, reproducible golden can key on the stable title instead of a
+        // random per-ingest doc_id. Titles are unique within a corpus.
         let rank = docs
             .iter()
-            .position(|d| d.document_id == item.doc_id)
+            .position(|d| {
+                d.document_id == item.doc_id
+                    || (!item.title.is_empty() && d.title.as_deref() == Some(item.title.as_str()))
+            })
             .map(|p| p as i32 + 1)
             .unwrap_or(-1);
         ranks.push(rank);

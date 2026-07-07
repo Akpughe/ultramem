@@ -1,0 +1,14 @@
+[
+  {"query": "which postgres pooling mode breaks server-side prepared statements and session advisory locks", "doc_id": "", "title": "PgBouncer transaction pooling and prepared statements"},
+  {"query": "which pooling mode holds a backend connection for the whole client session and preserves temporary tables", "doc_id": "", "title": "PgBouncer session pooling for long-lived connections"},
+  {"query": "multithreaded postgres pooler that spreads client connections across worker threads on many-core hosts", "doc_id": "", "title": "Odyssey pooler versus PgBouncer at scale"},
+  {"query": "why can a stateless signed access token not be revoked before it expires", "doc_id": "", "title": "JWT access token short expiry"},
+  {"query": "detecting a stolen refresh token by rotating and invalidating the old one on every use", "doc_id": "", "title": "JWT refresh token rotation"},
+  {"query": "httponly secure cookie plus an in-memory token to prevent XSS from exfiltrating the credential", "doc_id": "", "title": "Where to store JWTs in the browser"},
+  {"query": "cutting weekly mileage forty to sixty percent in the final weeks before a marathon while keeping some intensity", "doc_id": "", "title": "Marathon taper week"},
+  {"query": "how much slower than goal pace to run the weekly long run and how many hours to cap it", "doc_id": "", "title": "Marathon long-run pacing"},
+  {"query": "raising carbohydrate intake to eight to ten grams per kilogram in the last days before a race to fill glycogen", "doc_id": "", "title": "Marathon carbohydrate loading"},
+  {"query": "which kubernetes probe kills and restarts a wedged container when it fails", "doc_id": "", "title": "Kubernetes liveness probe"},
+  {"query": "which kubernetes probe removes a pod from service endpoints without restarting the process", "doc_id": "", "title": "Kubernetes readiness probe"},
+  {"query": "which kubernetes probe suspends liveness checks while a slow-booting container finishes initializing", "doc_id": "", "title": "Kubernetes startup probe"}
+]
