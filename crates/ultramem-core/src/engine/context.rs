@@ -38,8 +38,13 @@ pub async fn doc_context(
     // The opening of a document is almost always enough to characterise it,
     // and keeps this a cheap, single, short-input call.
     let head: String = content.chars().take(2000).collect();
-    let user = format!("Title: {title}\n\n{head}");
-    match llm.chat(model, SYSTEM, &user, 0.2).await {
+    // SS-5: the document opening is untrusted.
+    let system = format!("{SYSTEM}{}", super::promptguard::UNTRUSTED_NOTE);
+    let user = format!(
+        "Title: {title}\n\n{}",
+        super::promptguard::wrap_untrusted(&head)
+    );
+    match llm.chat(model, &system, &user, 0.2).await {
         Ok(raw) => {
             let line = raw
                 .trim()

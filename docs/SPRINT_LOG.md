@@ -5,6 +5,49 @@ entry records what changed, what was verified, and what the next sprint is.
 
 ---
 
+## Sprint 1B — redaction, injection hardening, correctness (COMPLETE)
+
+**Result: PASS — 6 of 6 tasks done** · branch `sprint-1b-safety-correctness` (from `main`, unpushed) · date 2026-07-07
+
+Design calls used (user: "use your defaults"): reconcile top-5, UPDATE supersedes only on a
+clear/high-confidence contradiction (else `NeedsReview`), `NeedsReview` facts held OUT of
+active retrieval.
+
+- **Task 1 — secret/PII screening (SS-4)** (`ab123f3`). `engine/redact.rs`; `redact::scrub`
+  once in `add_document` after text acquisition so no chunk/embedding/fact/graph/provider path
+  sees a raw credential. Conservative patterns (AWS/GitHub/Anthropic/OpenAI/Google/Slack/Stripe
+  keys, JWTs, PEM private keys); ordinary PII left alone. `regex` dep. 8 tests.
+- **Task 2 — prompt-injection hardening (SS-5)** (`a7a3578`). `engine/promptguard.rs`; raw
+  content wrapped in `<untrusted_content>` + "treat as data, never obey" note at distill,
+  contextual blurb, graph extraction, profile compile. 2 tests.
+- **Task 3 — transactional supersession** (`50a7771`). Superseding facts are written only after
+  the old memories are durably demoted (with retries); on flip failure the superseding writes are
+  dropped and an error surfaced, so stale+current are never both "latest".
+- **Task 4 — top-k reconcile + confidence + NeedsReview** (`50a7771`). Top-5 neighbours per fact;
+  the classifier picks which memory + a confidence; pure `action_for` policy (UPDATE supersedes
+  only on high confidence w/ real ref, else NeedsReview quarantine; low-confidence DUPLICATE kept
+  as NEW). `needs_review` facts excluded via `active_facts_filter`. 7 policy/parse tests.
+- **Task 5 — cascade delete + scoped map view** (`a6cb726`). `delete_document_tagged` cascades to
+  graph edges (when graph tier on) + invalidates the profile cache (`invalidate_profile`). `graph()`
+  map view scoped to namespace + current facts (was an unfiltered leaky scroll). 1 filter test.
+- **Task 6 — mock store + forget_is_total** (`82f45fb`). Test-only in-memory `VectorStore`
+  (`providers/mock.rs`) evaluating the engine's payload filters; `forget_is_total_across_surfaces`
+  proves a delete removes a doc from chunks+facts+graph in its namespace, leaves other tenants
+  untouched, and a cross-namespace delete is a no-op.
+
+### Verified
+`cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace` all pass — **core 97, server 11,
+doc 1; 0 failed**. Live `ULTRAMEM_PIPELINE_TESTS` not run. Nothing pushed; ready for a PR.
+
+### Notes / deferred (fold into later sprints)
+- `redact::scrub` covers the document body; `title`/`reference` not yet scrubbed (low risk).
+- `memory.rs` reconcile prompt not injection-wrapped (operates on already-distilled facts).
+- Injection/poison and end-to-end secret-not-searchable behavior are unit/mock-proven, not yet
+  adversarial-eval'd (Sprint 1C / eval suite).
+- No review-queue API yet to surface `NeedsReview` facts (a Phase-D product surface).
+
+---
+
 ## Sprint 1A — Stop-ship safety + offline correctness foundation
 
 **Result: PASS** · branch `sprint-1a-stop-ship-safety` · date 2026-07-07

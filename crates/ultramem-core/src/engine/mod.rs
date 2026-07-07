@@ -16,7 +16,9 @@ pub mod jina;
 pub mod memory;
 pub mod mistral;
 pub mod profile;
+pub mod promptguard;
 pub mod qdrant;
+pub mod redact;
 pub mod rewrite;
 pub mod sparse;
 pub mod urlinfo;
@@ -486,6 +488,10 @@ impl MemoryEngine {
             content
         };
         let content: String = content.chars().take(MAX_DOC_CHARS).collect();
+        // 1b. Scrub high-confidence secrets (SS-4) at the single choke point —
+        // before chunking, embedding, storage, distillation, or any provider
+        // call sees the text. Conservative: credentials only, not ordinary PII.
+        let content = redact::scrub(&content);
 
         // 2. Chunk — strategy follows content type (markdown by heading,
         // transcript by speaker turn, else paragraph).
@@ -738,8 +744,8 @@ impl MemoryEngine {
         // Reconcile against the existing memory graph (skip when disabled — then
         // every fact is simply NEW).
         let actions = if cfg.memory_graph {
-            // For each new fact, find its single nearest *latest* memory.
-            let mut with_neighbors: Vec<(String, Option<memory::Neighbor>)> =
+            // For each new fact, find its top-k nearest *latest* memories.
+            let mut with_neighbors: Vec<(String, Vec<memory::Neighbor>)> =
                 Vec::with_capacity(facts.len());
             for (fact, vec) in facts.iter().zip(fvecs.iter()) {
                 // Reconcile only within the same namespace — a fact in tenant A
@@ -753,23 +759,26 @@ impl MemoryEngine {
                     .search(
                         &cfg.facts_collection,
                         vec,
-                        1,
+                        memory::RECONCILE_TOPK,
                         memory::RELATE_THRESHOLD,
                         Some(neighbor_filter),
                     )
                     .await
                     .unwrap_or_default();
-                let neighbor = hits.first().and_then(|h| {
-                    Some(memory::Neighbor {
-                        memory_id: h["id"].as_str()?.to_string(),
-                        fact: h["payload"]["fact"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_string(),
-                        score: h["score"].as_f64().unwrap_or(0.0) as f32,
+                let neighbors = hits
+                    .iter()
+                    .filter_map(|h| {
+                        Some(memory::Neighbor {
+                            memory_id: h["id"].as_str()?.to_string(),
+                            fact: h["payload"]["fact"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string(),
+                            score: h["score"].as_f64().unwrap_or(0.0) as f32,
+                        })
                     })
-                });
-                with_neighbors.push((fact.clone(), neighbor));
+                    .collect();
+                with_neighbors.push((fact.clone(), neighbors));
             }
             memory::reconcile(self.llm.as_ref(), &cfg.distill_model, with_neighbors).await
         } else {
@@ -784,23 +793,25 @@ impl MemoryEngine {
                 .collect()
         };
 
-        // Build points for everything that survives (drop DUPLICATEs), and
-        // collect the ids of memories that got superseded.
+        // Build points. Split them so a fact that SUPERSEDES an existing memory
+        // is only written after that memory has actually been demoted (Task 3) —
+        // otherwise a failed flip would leave both the old and new value served
+        // as "latest". NeedsReview facts are stored but quarantined
+        // (`needs_review=true`), held out of active retrieval until reviewed.
         let fact_vec: std::collections::HashMap<&str, &Vec<f32>> =
             facts.iter().map(|s| s.as_str()).zip(fvecs.iter()).collect();
-        let mut points: Vec<Value> = Vec::new();
+        let mut plain_points: Vec<Value> = Vec::new();
+        let mut supersede_points: Vec<Value> = Vec::new();
         let mut superseded: Vec<String> = Vec::new();
         for action in &actions {
             if action.relation == memory::Relation::Duplicate {
                 continue;
             }
-            if let Some(old) = &action.supersedes {
-                superseded.push(old.clone());
-            }
             let Some(vec) = fact_vec.get(action.fact.as_str()) else {
                 continue;
             };
-            points.push(json!({
+            let needs_review = action.relation == memory::Relation::NeedsReview;
+            let point = json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "vector": vec,
                 "payload": {
@@ -810,32 +821,62 @@ impl MemoryEngine {
                     "source": doc.source,
                     "captured_at": doc.captured_at,
                     "is_latest": true,
+                    "needs_review": needs_review,
                     "kind": "fact",
                     "supersedes": action.supersedes,
                     "extends": action.extends,
                     "valid_until": expiry.get(action.fact.as_str()).copied().flatten(),
                     "container_tag": doc.tag(),
                 },
-            }));
+            });
+            if let Some(old) = &action.supersedes {
+                superseded.push(old.clone());
+                supersede_points.push(point);
+            } else {
+                plain_points.push(point);
+            }
         }
 
-        self.store.upsert(&cfg.facts_collection, points).await?;
+        // Non-superseding facts are always safe to write.
+        self.store
+            .upsert(&cfg.facts_collection, plain_points)
+            .await?;
 
-        // Flag superseded memories as no longer latest (history preserved).
+        // Superseding facts: demote the old memories FIRST (with a couple of
+        // retries), and only write the new values if that succeeds. If the flip
+        // can't be made durable, drop the superseding writes rather than serve
+        // two "latest" values, and surface the error so a reindex can retry.
         if !superseded.is_empty() {
-            if let Err(e) = self
-                .store
-                .set_payload(
-                    &cfg.facts_collection,
-                    &superseded,
-                    json!({ "is_latest": false }),
-                )
-                .await
-            {
-                eprintln!(
-                    "[recally] failed to flag {} superseded memories: {e}",
-                    superseded.len()
-                );
+            let mut flipped = false;
+            let mut last_err = String::new();
+            for _ in 0..3 {
+                match self
+                    .store
+                    .set_payload(
+                        &cfg.facts_collection,
+                        &superseded,
+                        json!({ "is_latest": false }),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        flipped = true;
+                        break;
+                    }
+                    Err(e) => last_err = e,
+                }
+            }
+            if flipped {
+                self.store
+                    .upsert(&cfg.facts_collection, supersede_points)
+                    .await?;
+            } else {
+                return Err(format!(
+                    "supersession flip failed for {} memories ({last_err}); {} superseding fact(s) \
+                     not written to avoid serving stale+current together — retry via reindex",
+                    superseded.len(),
+                    supersede_points.len()
+                ));
             }
         }
         Ok(())
@@ -1405,12 +1446,28 @@ impl MemoryEngine {
         self.profile_tagged(tag).await
     }
 
+    /// Drop the cached profile for a namespace so the next `profile_tagged`
+    /// recompiles from current facts. Cheap (no LLM) — used after a delete so a
+    /// forgotten fact can't keep being asserted from a stale cached profile.
+    pub fn invalidate_profile(&self, tag: &str) {
+        self.profile_cache.write().unwrap().remove(tag);
+    }
+
     /// The memory graph for the map view: distilled facts connected to the
     /// documents they were learned from. Document metadata comes from each
     /// fact's payload, so one scroll over the facts collection is enough.
-    pub async fn graph(&self, limit: usize) -> Result<Value, String> {
+    pub async fn graph(&self, tag: &str, limit: usize) -> Result<Value, String> {
         let cfg = self.cfg();
-        let points = self.store.scroll(&cfg.facts_collection, limit).await?;
+        // Scope to the namespace and to current facts only — an unfiltered scroll
+        // leaked superseded/expired/quarantined facts and other tenants' data.
+        let filter = tagged_filter(
+            Some(active_facts_filter(None, chrono::Utc::now().timestamp())),
+            tag,
+        );
+        let points = self
+            .store
+            .scroll_all(&cfg.facts_collection, Some(filter), limit)
+            .await?;
 
         let mut nodes: Vec<Value> = Vec::new();
         let mut edges: Vec<Value> = Vec::new();
@@ -1627,10 +1684,22 @@ impl MemoryEngine {
         let (a, b) = tokio::join!(
             self.store
                 .delete_by_filter(&cfg.chunks_collection, filter.clone()),
-            self.store.delete_by_filter(&cfg.facts_collection, filter),
+            self.store
+                .delete_by_filter(&cfg.facts_collection, filter.clone()),
         );
         a?;
         b?;
+        // Cascade: knowledge-graph edges derived from this document must go too,
+        // or a "forgotten" fact keeps resolving into answers via the graph. Only
+        // when the graph tier is enabled (else the collection may not exist).
+        if cfg.temporal_graph {
+            self.store
+                .delete_by_filter(&cfg.graph_collection, filter)
+                .await?;
+        }
+        // And drop the cached profile so the deleted fact isn't still asserted
+        // from a stale standing profile for up to the TTL.
+        self.invalidate_profile(tag);
         Ok(true)
     }
 }
@@ -1695,9 +1764,10 @@ fn doc_delete_filter(doc_id: &str, tag: &str) -> Value {
 }
 
 /// Wrap a base filter (or none) so it also excludes memories that are no longer
-/// current: superseded (`is_latest = false`) or expired (`valid_until < now`).
-/// Legacy facts lack both fields, so neither exclusion matches them — they stay
-/// searchable (treated as latest, never-expiring). `now` is unix seconds.
+/// current: superseded (`is_latest = false`), expired (`valid_until < now`), or
+/// quarantined pending review (`needs_review = true`). Legacy facts lack all
+/// three fields, so no exclusion matches them — they stay searchable (treated as
+/// latest, never-expiring, reviewed). `now` is unix seconds.
 fn active_facts_filter(base: Option<Value>, now: i64) -> Value {
     let mut f = base.unwrap_or_else(|| json!({}));
     if let Some(obj) = f.as_object_mut() {
@@ -1705,6 +1775,7 @@ fn active_facts_filter(base: Option<Value>, now: i64) -> Value {
         if let Some(a) = must_not.as_array_mut() {
             a.push(json!({ "key": "is_latest", "match": { "value": false } }));
             a.push(json!({ "key": "valid_until", "range": { "lt": now } }));
+            a.push(json!({ "key": "needs_review", "match": { "value": true } }));
         }
     }
     f
@@ -2016,6 +2087,88 @@ mod tests {
             .iter()
             .any(|c| c["key"] == "doc_id" && c["match"]["value"] == "doc-xyz"));
         assert!(f["should"].as_array().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn active_facts_filter_excludes_superseded_expired_and_review() {
+        // Backs both the retrieval holdout (Task 4) and the scoped map view (Task 5):
+        // current facts only — not superseded, expired, or quarantined-for-review.
+        let f = active_facts_filter(None, 1_000);
+        let must_not = f["must_not"].as_array().unwrap();
+        assert!(must_not
+            .iter()
+            .any(|c| c["key"] == "is_latest" && c["match"]["value"] == false));
+        assert!(must_not.iter().any(|c| c["key"] == "valid_until"));
+        assert!(must_not
+            .iter()
+            .any(|c| c["key"] == "needs_review" && c["match"]["value"] == true));
+    }
+
+    /// forget_is_total: deleting a document removes it from chunks, facts, AND
+    /// graph edges within its namespace, while another tenant's data is untouched.
+    /// Runs offline against the in-memory mock store (no Qdrant/providers).
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn forget_is_total_across_surfaces() {
+        use crate::providers::mock::MemStore;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = EngineCfg::default();
+            cfg.chunks_collection = "c".into();
+            cfg.facts_collection = "f".into();
+            cfg.graph_collection = "g".into();
+            cfg.temporal_graph = true; // so the delete cascades to edges
+            let store = std::sync::Arc::new(MemStore::new());
+            let engine = MemoryEngine::new(cfg).with_store(store.clone());
+
+            let (tag, doc) = ("tenant_x", "doc-1");
+            store
+                .upsert(
+                    "c",
+                    vec![json!({"id":"c1","vector":[0.0],"payload":{"doc_id":doc,"container_tag":tag,"content":"a chunk"}})],
+                )
+                .await
+                .unwrap();
+            store
+                .upsert(
+                    "f",
+                    vec![
+                        json!({"id":"f1","vector":[0.0],"payload":{"doc_id":doc,"container_tag":tag,"fact":"the user loves X","is_latest":true}}),
+                        // Another tenant's fact — must survive the delete.
+                        json!({"id":"f2","vector":[0.0],"payload":{"doc_id":"doc-2","container_tag":"tenant_y","fact":"other","is_latest":true}}),
+                    ],
+                )
+                .await
+                .unwrap();
+            store
+                .upsert(
+                    "g",
+                    vec![json!({"id":"g1","vector":[0.0],"payload":{"doc_id":doc,"container_tag":tag,"subject":"user","is_latest":true}})],
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(store.count("c"), 1);
+            assert_eq!(store.count("f"), 2);
+            assert_eq!(store.count("g"), 1);
+
+            let deleted = engine.delete_document_tagged(doc, tag).await.unwrap();
+            assert!(deleted, "existing document should report deleted");
+
+            // Gone from every surface for this doc…
+            assert_eq!(store.count("c"), 0, "chunks survived the delete");
+            assert_eq!(store.count("g"), 0, "graph edges survived the delete");
+            let doc1_facts =
+                store.count_matching("f", &json!({ "must": [{ "key": "doc_id", "match": { "value": doc } }] }));
+            assert_eq!(doc1_facts, 0, "facts survived the delete");
+            // …but the other tenant's fact is untouched.
+            assert_eq!(store.count("f"), 1, "cross-tenant fact wrongly deleted");
+
+            // And deleting a doc that isn't in the caller's namespace is a no-op.
+            let again = engine.delete_document_tagged("doc-2", tag).await.unwrap();
+            assert!(!again, "cross-namespace delete must report not-found");
+            assert_eq!(store.count("f"), 1);
+        });
     }
 
     #[test]

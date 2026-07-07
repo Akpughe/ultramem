@@ -22,6 +22,8 @@ use serde_json::Value;
 pub mod jina;
 pub mod llm_provider;
 pub mod mistral;
+#[cfg(test)]
+pub mod mock;
 pub mod openai;
 pub mod qdrant_store;
 

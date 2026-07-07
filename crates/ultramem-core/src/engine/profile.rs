@@ -120,8 +120,11 @@ pub async fn compile(
         .map(|f| format!("- {f}"))
         .collect::<Vec<_>>()
         .join("\n");
+    // SS-5: facts are derived from untrusted content; the profile feeds a
+    // downstream system prompt, so it must never launder an injected instruction.
+    let static_system = format!("{STATIC_SYSTEM}{}", super::promptguard::DERIVED_NOTE);
     let static_text = llm
-        .chat(model, STATIC_SYSTEM, &durable_input, 0.2)
+        .chat(model, &static_system, &durable_input, 0.2)
         .await
         .unwrap_or_default();
 
@@ -136,7 +139,8 @@ pub async fn compile(
             .map(|(_, f)| format!("- {f}"))
             .collect::<Vec<_>>()
             .join("\n");
-        llm.chat(model, DYNAMIC_SYSTEM, &recent_input, 0.2)
+        let dynamic_system = format!("{DYNAMIC_SYSTEM}{}", super::promptguard::DERIVED_NOTE);
+        llm.chat(model, &dynamic_system, &recent_input, 0.2)
             .await
             .unwrap_or_default()
     };

@@ -105,8 +105,13 @@ pub async fn extract_edges(
     // Cap the content fed to one pass; edges are dense facts, not prose, so a
     // generous head covers a session without paying for the whole haystack.
     let body: String = content.chars().take(24_000).collect();
-    let user = format!("{date_line}Title: {title}\n\n{body}");
-    let raw = llm.chat(model, EXTRACT_SYSTEM, &user, 0.2).await?;
+    // SS-5: the conversation body is untrusted content.
+    let system = format!("{EXTRACT_SYSTEM}{}", super::promptguard::UNTRUSTED_NOTE);
+    let user = format!(
+        "{date_line}Title: {title}\n\n{}",
+        super::promptguard::wrap_untrusted(&body)
+    );
+    let raw = llm.chat(model, &system, &user, 0.2).await?;
     Ok(parse_edges(&raw, doc_date))
 }
 
