@@ -31,6 +31,10 @@ impl MockDb {
     pub fn memory(&self, id: &str) -> Option<MemoryRow> {
         self.memories.lock().unwrap().get(id).cloned()
     }
+    /// Test helper: all stored memory rows.
+    pub fn memories(&self) -> Vec<MemoryRow> {
+        self.memories.lock().unwrap().values().cloned().collect()
+    }
 }
 
 #[async_trait]

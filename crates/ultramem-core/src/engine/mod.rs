@@ -546,24 +546,25 @@ impl MemoryEngine {
         // indexing below — no second distill. Off by default (production keeps
         // the distill-after-upsert order so chunks are searchable immediately).
         let do_distill = cfg.distill && content.chars().count() >= 280;
-        let early_facts: Option<Vec<String>> = if cfg.fact_augmented_keys && do_distill {
-            Some(
-                distill::distill_facts(
-                    self.llm.as_ref(),
-                    &cfg.distill_model,
-                    &doc.title,
-                    &content,
-                    &date_str(doc.captured_at),
+        let early_facts: Option<Vec<distill::DistilledFact>> =
+            if cfg.fact_augmented_keys && do_distill {
+                Some(
+                    distill::distill_facts_typed(
+                        self.llm.as_ref(),
+                        &cfg.distill_model,
+                        &doc.title,
+                        &content,
+                        &date_str(doc.captured_at),
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("[recally] distill failed for '{}': {e}", doc.title);
+                        vec![]
+                    }),
                 )
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("[recally] distill failed for '{}': {e}", doc.title);
-                    vec![]
-                }),
-            )
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // 3. Embed. Titles and filenames carry meaning the body often never
         // repeats ("newton-profile.pdf" describes every page of it), so every
@@ -580,7 +581,7 @@ impl MemoryEngine {
         let fact_key = early_facts.as_ref().filter(|f| !f.is_empty()).map(|f| {
             f.iter()
                 .take(8)
-                .cloned()
+                .map(|x| x.statement.clone())
                 .collect::<Vec<_>>()
                 .join("; ")
                 .chars()
@@ -695,7 +696,7 @@ impl MemoryEngine {
                 if !do_distill {
                     return Ok(doc_id);
                 }
-                match distill::distill_facts(
+                match distill::distill_facts_typed(
                     self.llm.as_ref(),
                     &cfg.distill_model,
                     &doc.title,
@@ -808,18 +809,26 @@ impl MemoryEngine {
         cfg: &EngineCfg,
         doc: &IngestDoc,
         doc_id: &str,
-        facts: Vec<String>,
+        typed: Vec<distill::DistilledFact>,
     ) -> Result<(), String> {
         // Strip any "[until YYYY-MM-DD]" expiry suffix before embedding, so the
         // vector reflects the fact, not the bookkeeping. `facts` below is the
-        // cleaned text; `expiry` maps clean text → valid_until.
-        let parsed: Vec<(String, Option<i64>)> =
-            facts.iter().map(|f| memory::parse_expiry(f)).collect();
+        // cleaned statement text; `expiry` maps clean text → valid_until, and
+        // `meta` maps clean text → (kind, confidence) for the typed memory rows.
+        let parsed: Vec<(String, Option<i64>)> = typed
+            .iter()
+            .map(|f| memory::parse_expiry(&f.statement))
+            .collect();
         let facts: Vec<String> = parsed.iter().map(|(f, _)| f.clone()).collect();
         let expiry: std::collections::HashMap<&str, Option<i64>> = facts
             .iter()
             .map(|s| s.as_str())
             .zip(parsed.iter().map(|(_, e)| *e))
+            .collect();
+        let meta: std::collections::HashMap<String, (String, f32)> = facts
+            .iter()
+            .cloned()
+            .zip(typed.iter().map(|f| (f.kind.clone(), f.confidence)))
             .collect();
         let fvecs = self.embedder.embed(EmbedTask::Passage, &facts).await?;
 
@@ -900,6 +909,10 @@ impl MemoryEngine {
             let needs_review = action.relation == memory::Relation::NeedsReview;
             let mem_id = uuid::Uuid::new_v4().to_string();
             let valid_until = expiry.get(action.fact.as_str()).copied().flatten();
+            let (kind, confidence) = meta
+                .get(&action.fact)
+                .map(|(k, c)| (k.clone(), Some(*c)))
+                .unwrap_or_else(|| ("unknown".into(), None));
             let point = json!({
                 "id": mem_id,
                 "vector": vec,
@@ -911,7 +924,7 @@ impl MemoryEngine {
                     "captured_at": doc.captured_at,
                     "is_latest": true,
                     "needs_review": needs_review,
-                    "kind": "fact",
+                    "kind": kind,
                     "supersedes": action.supersedes,
                     "extends": action.extends,
                     "valid_until": valid_until,
@@ -922,9 +935,9 @@ impl MemoryEngine {
                 mem_rows.push(crate::db::MemoryRow {
                     id: mem_id.clone(),
                     container_tag: doc.tag().to_string(),
-                    kind: "unknown".into(), // typed extraction lands in Task 4b
+                    kind: kind.clone(),
                     statement: action.fact.clone(),
-                    confidence: None,
+                    confidence,
                     is_latest: true,
                     needs_review,
                     supersedes: action.supersedes.clone(),
@@ -1769,7 +1782,7 @@ impl MemoryEngine {
         self.store
             .delete_by_doc(&cfg.facts_collection, doc_id)
             .await?;
-        let facts = distill::distill_facts(
+        let facts = distill::distill_facts_typed(
             self.llm.as_ref(),
             &cfg.distill_model,
             &doc.title,
@@ -2609,7 +2622,7 @@ mod tests {
                 .with_store(Arc::new(MemStore::new()))
                 .with_embedder(Arc::new(MockEmbedder { dim: 8 }))
                 .with_llm(Arc::new(CapturingLlm::new(
-                    r#"["the user prefers Rust for backend work"]"#,
+                    r#"[{"statement":"the user prefers Rust for backend work","kind":"preference","confidence":0.9}]"#,
                 )))
                 .with_db(db.clone());
             let doc = IngestDoc {
@@ -2624,10 +2637,12 @@ mod tests {
                 container_tag: "tenant_x".into(),
             };
             engine.add_document(&doc).await.unwrap();
-            assert!(
-                db.memory_count() >= 1,
-                "a distilled fact should be dual-written as a memory row"
-            );
+            let mems = db.memories();
+            assert_eq!(mems.len(), 1, "a distilled fact should be a memory row");
+            // Task 4b: the typed kind + confidence flow through to the row.
+            assert_eq!(mems[0].kind, "preference");
+            assert_eq!(mems[0].confidence, Some(0.9));
+            assert_eq!(mems[0].statement, "the user prefers Rust for backend work");
         });
     }
 
