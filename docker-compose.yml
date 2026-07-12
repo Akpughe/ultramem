@@ -8,12 +8,26 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
 
+  # Phase A source of truth. Present so the infra is ready; the engine only uses
+  # it when ULTRAMEM_PG_URL is set (scaffold — no dual-write yet).
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ultramem
+      POSTGRES_PASSWORD: ultramem
+      POSTGRES_DB: ultramem
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
   ultramem:
     build:
       context: .
       dockerfile: Dockerfile
     depends_on:
       - qdrant
+      - postgres
     ports:
       - "8080:8080"
     environment:
@@ -26,7 +40,10 @@ services:
       ULTRAMEM_EMBEDDER: ${ULTRAMEM_EMBEDDER:-jina}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ULTRAMEM_API_KEY: ${ULTRAMEM_API_KEY}
+      # Phase A: unset by default (engine unchanged). Uncomment to enable the SoT.
+      ULTRAMEM_PG_URL: ${ULTRAMEM_PG_URL:-}
       PORT: "8080"
 
 volumes:
   qdrant_data:
+  pg_data:
