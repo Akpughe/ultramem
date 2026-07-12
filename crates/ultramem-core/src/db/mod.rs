@@ -69,6 +69,20 @@ pub struct MemoryRow {
     pub created_at: i64,
 }
 
+/// One evidence row: the verbatim source span supporting a memory. Written only
+/// when the quote is validated as a substring of the cited chunk (never fabricated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceRow {
+    pub id: String,
+    pub memory_id: String,
+    pub document_id: String,
+    pub chunk_id: Option<String>,
+    pub char_start: Option<i32>,
+    pub char_end: Option<i32>,
+    pub quote: String,
+    pub extractor: String,
+}
+
 /// The relational source of truth. Connection state lives in the impl; the engine
 /// holds an `Option<Arc<dyn Db>>` and uses it only when configured.
 #[async_trait]
@@ -110,4 +124,6 @@ pub trait Db: Send + Sync {
     /// Mirror a supersession: for each `(old_id, new_id)`, mark the old memory
     /// `is_latest = false` and record `superseded_by = new_id`.
     async fn mark_superseded(&self, pairs: &[(String, String)]) -> Result<(), String>;
+    /// Insert memory-evidence rows (idempotent by id).
+    async fn insert_evidence(&self, rows: &[EvidenceRow]) -> Result<(), String>;
 }

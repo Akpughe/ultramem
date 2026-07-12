@@ -5,13 +5,14 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::{ChunkRow, Db, DocumentRow, MemoryRow};
+use super::{ChunkRow, Db, DocumentRow, EvidenceRow, MemoryRow};
 
 #[derive(Default)]
 pub struct MockDb {
     docs: Mutex<HashMap<String, DocumentRow>>,
     chunks: Mutex<HashMap<String, ChunkRow>>,
     memories: Mutex<HashMap<String, MemoryRow>>,
+    evidence: Mutex<Vec<EvidenceRow>>,
 }
 
 impl MockDb {
@@ -34,6 +35,10 @@ impl MockDb {
     /// Test helper: all stored memory rows.
     pub fn memories(&self) -> Vec<MemoryRow> {
         self.memories.lock().unwrap().values().cloned().collect()
+    }
+    /// Test helper: all stored evidence rows.
+    pub fn evidence(&self) -> Vec<EvidenceRow> {
+        self.evidence.lock().unwrap().clone()
     }
 }
 
@@ -128,6 +133,10 @@ impl Db for MockDb {
                 m.superseded_by = Some(new_id.clone());
             }
         }
+        Ok(())
+    }
+    async fn insert_evidence(&self, rows: &[EvidenceRow]) -> Result<(), String> {
+        self.evidence.lock().unwrap().extend_from_slice(rows);
         Ok(())
     }
 }

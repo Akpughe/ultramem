@@ -681,12 +681,21 @@ impl MemoryEngine {
         }
 
         // 5. Index memories. Tiny captures carry no facts beyond their own text
-        // (already embedded), so distillation is skipped for them.
+        // (already embedded), so distillation is skipped for them. Chunk (id,
+        // text) pairs let index_memories ground each fact's evidence quote.
+        let chunk_pairs: Vec<(String, String)> = chunk_ids
+            .iter()
+            .cloned()
+            .zip(chunks.iter().cloned())
+            .collect();
         match early_facts {
             // Fact-augmented path: facts were already distilled in step 2b.
             Some(facts) => {
                 if !facts.is_empty() {
-                    if let Err(e) = self.index_memories(&cfg, doc, &doc_id, facts).await {
+                    if let Err(e) = self
+                        .index_memories(&cfg, doc, &doc_id, facts, &chunk_pairs)
+                        .await
+                    {
                         eprintln!("[recally] memory indexing failed for '{}': {e}", doc.title);
                     }
                 }
@@ -706,7 +715,10 @@ impl MemoryEngine {
                 .await
                 {
                     Ok(facts) if !facts.is_empty() => {
-                        if let Err(e) = self.index_memories(&cfg, doc, &doc_id, facts).await {
+                        if let Err(e) = self
+                            .index_memories(&cfg, doc, &doc_id, facts, &chunk_pairs)
+                            .await
+                        {
                             eprintln!("[recally] memory indexing failed for '{}': {e}", doc.title);
                         }
                     }
@@ -810,6 +822,7 @@ impl MemoryEngine {
         doc: &IngestDoc,
         doc_id: &str,
         typed: Vec<distill::DistilledFact>,
+        chunks: &[(String, String)],
     ) -> Result<(), String> {
         // Strip any "[until YYYY-MM-DD]" expiry suffix before embedding, so the
         // vector reflects the fact, not the bookkeeping. `facts` below is the
@@ -825,10 +838,14 @@ impl MemoryEngine {
             .map(|s| s.as_str())
             .zip(parsed.iter().map(|(_, e)| *e))
             .collect();
-        let meta: std::collections::HashMap<String, (String, f32)> = facts
+        let meta: std::collections::HashMap<String, (String, f32, String)> = facts
             .iter()
             .cloned()
-            .zip(typed.iter().map(|f| (f.kind.clone(), f.confidence)))
+            .zip(
+                typed
+                    .iter()
+                    .map(|f| (f.kind.clone(), f.confidence, f.evidence.clone())),
+            )
             .collect();
         let fvecs = self.embedder.embed(EmbedTask::Passage, &facts).await?;
 
@@ -895,10 +912,11 @@ impl MemoryEngine {
         let mut plain_points: Vec<Value> = Vec::new();
         let mut supersede_points: Vec<Value> = Vec::new();
         let mut superseded: Vec<String> = Vec::new();
-        // Phase A: typed memory rows to dual-write, and (old_id, new_id) pairs to
-        // mirror supersessions. Built only when a Db is attached.
+        // Phase A: typed memory rows to dual-write, (old_id, new_id) supersession
+        // pairs, and grounded evidence rows. Built only when a Db is attached.
         let mut mem_rows: Vec<crate::db::MemoryRow> = Vec::new();
         let mut supersede_pairs: Vec<(String, String)> = Vec::new();
+        let mut evidence_rows: Vec<crate::db::EvidenceRow> = Vec::new();
         for action in &actions {
             if action.relation == memory::Relation::Duplicate {
                 continue;
@@ -909,10 +927,27 @@ impl MemoryEngine {
             let needs_review = action.relation == memory::Relation::NeedsReview;
             let mem_id = uuid::Uuid::new_v4().to_string();
             let valid_until = expiry.get(action.fact.as_str()).copied().flatten();
-            let (kind, confidence) = meta
+            let (kind, confidence, evidence) = meta
                 .get(&action.fact)
-                .map(|(k, c)| (k.clone(), Some(*c)))
-                .unwrap_or_else(|| ("unknown".into(), None));
+                .map(|(k, c, e)| (k.clone(), Some(*c), e.clone()))
+                .unwrap_or_else(|| ("unknown".into(), None, String::new()));
+            // Evidence: only when the model's quote is a real substring of a
+            // chunk (grounded, never fabricated). Same success-path timing as the
+            // memory rows below (inserted at the end).
+            if self.db.is_some() {
+                if let Some((chunk_id, cs, ce)) = find_evidence_span(&evidence, chunks) {
+                    evidence_rows.push(crate::db::EvidenceRow {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        memory_id: mem_id.clone(),
+                        document_id: doc_id.to_string(),
+                        chunk_id: Some(chunk_id),
+                        char_start: Some(cs),
+                        char_end: Some(ce),
+                        quote: evidence.trim().to_string(),
+                        extractor: "distill".into(),
+                    });
+                }
+            }
             let point = json!({
                 "id": mem_id,
                 "vector": vec,
@@ -1016,6 +1051,11 @@ impl MemoryEngine {
             if !supersede_pairs.is_empty() {
                 if let Err(e) = db.mark_superseded(&supersede_pairs).await {
                     eprintln!("[ultramem] pg mark_superseded failed: {e}");
+                }
+            }
+            if !evidence_rows.is_empty() {
+                if let Err(e) = db.insert_evidence(&evidence_rows).await {
+                    eprintln!("[ultramem] pg insert_evidence failed: {e}");
                 }
             }
         }
@@ -1792,7 +1832,9 @@ impl MemoryEngine {
         .await?;
         let n = facts.len();
         if !facts.is_empty() {
-            self.index_memories(&cfg, doc, doc_id, facts).await?;
+            // Reconstructed text has no fresh chunk ids to ground evidence
+            // against, so no evidence rows here — they're written on fresh ingest.
+            self.index_memories(&cfg, doc, doc_id, facts, &[]).await?;
         }
         Ok(n)
     }
@@ -1960,6 +2002,24 @@ fn date_str(unix: i64) -> String {
     chrono::DateTime::from_timestamp(unix, 0)
         .map(|d| d.format("%Y-%m-%d").to_string())
         .unwrap_or_default()
+}
+
+/// Locate a distiller's evidence quote inside the document's chunks, validating
+/// it is a real substring (grounded, never fabricated). Returns the chunk id and
+/// char offsets of the match, or `None` if the quote is too short or not found.
+fn find_evidence_span(evidence: &str, chunks: &[(String, String)]) -> Option<(String, i32, i32)> {
+    let ev = evidence.trim();
+    if ev.chars().count() < 8 {
+        return None;
+    }
+    for (id, text) in chunks {
+        if let Some(byte_pos) = text.find(ev) {
+            let char_start = text[..byte_pos].chars().count() as i32;
+            let char_end = char_start + ev.chars().count() as i32;
+            return Some((id.clone(), char_start, char_end));
+        }
+    }
+    None
 }
 
 /// Hex sha256 of the (scrubbed) document text — the doc-level dedup key.
@@ -2622,7 +2682,7 @@ mod tests {
                 .with_store(Arc::new(MemStore::new()))
                 .with_embedder(Arc::new(MockEmbedder { dim: 8 }))
                 .with_llm(Arc::new(CapturingLlm::new(
-                    r#"[{"statement":"the user prefers Rust for backend work","kind":"preference","confidence":0.9}]"#,
+                    r#"[{"statement":"the user prefers Rust for backend work","kind":"preference","confidence":0.9,"evidence":"Engineering notes for the week"}]"#,
                 )))
                 .with_db(db.clone());
             let doc = IngestDoc {
@@ -2643,7 +2703,32 @@ mod tests {
             assert_eq!(mems[0].kind, "preference");
             assert_eq!(mems[0].confidence, Some(0.9));
             assert_eq!(mems[0].statement, "the user prefers Rust for backend work");
+            // Task 4c: a grounded evidence row, tied to the memory + a chunk.
+            let ev = db.evidence();
+            assert_eq!(ev.len(), 1, "a grounded evidence span should be written");
+            assert_eq!(ev[0].memory_id, mems[0].id);
+            assert!(ev[0].quote.contains("Engineering notes for the week"));
+            assert!(ev[0].chunk_id.is_some(), "evidence is tied to a chunk");
         });
+    }
+
+    #[test]
+    fn find_evidence_span_validates_substring() {
+        let chunks = vec![
+            ("c1".to_string(), "some intro text here".to_string()),
+            (
+                "c2".to_string(),
+                "the user prefers Rust for backend work".to_string(),
+            ),
+        ];
+        // A real substring → grounded to its chunk with char offsets.
+        let (id, start, end) = find_evidence_span("prefers Rust", &chunks).unwrap();
+        assert_eq!(id, "c2");
+        assert_eq!(&chunks[1].1[start as usize..end as usize], "prefers Rust");
+        // Not present anywhere → no span (never fabricated).
+        assert!(find_evidence_span("prefers Go", &chunks).is_none());
+        // Too short to be meaningful → no span.
+        assert!(find_evidence_span("Rust", &chunks).is_none());
     }
 
     #[test]
