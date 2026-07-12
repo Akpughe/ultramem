@@ -47,6 +47,28 @@ pub struct ChunkRow {
     pub dim: i32,
 }
 
+/// One memory row (mirrors a distilled fact; `id` equals the Qdrant fact point
+/// id). `kind`/`confidence`/`event_from` are populated by the schema'd extractor
+/// in Task 4b; for now they default (`unknown`/`None`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryRow {
+    pub id: String,
+    pub container_tag: String,
+    pub kind: String,
+    pub statement: String,
+    pub confidence: Option<f32>,
+    pub is_latest: bool,
+    pub needs_review: bool,
+    pub supersedes: Option<String>,
+    pub superseded_by: Option<String>,
+    pub extends: Option<String>,
+    pub event_from: Option<i64>,
+    pub valid_until: Option<i64>,
+    pub learned_at: i64,
+    pub document_id: String,
+    pub created_at: i64,
+}
+
 /// The relational source of truth. Connection state lives in the impl; the engine
 /// holds an `Option<Arc<dyn Db>>` and uses it only when configured.
 #[async_trait]
@@ -83,4 +105,9 @@ pub trait Db: Send + Sync {
         before: Option<i64>,
         limit: i64,
     ) -> Result<Vec<DocumentRow>, String>;
+    /// Insert distilled memory rows (idempotent by id).
+    async fn insert_memories(&self, memories: &[MemoryRow]) -> Result<(), String>;
+    /// Mirror a supersession: for each `(old_id, new_id)`, mark the old memory
+    /// `is_latest = false` and record `superseded_by = new_id`.
+    async fn mark_superseded(&self, pairs: &[(String, String)]) -> Result<(), String>;
 }

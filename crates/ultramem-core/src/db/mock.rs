@@ -5,12 +5,13 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::{ChunkRow, Db, DocumentRow};
+use super::{ChunkRow, Db, DocumentRow, MemoryRow};
 
 #[derive(Default)]
 pub struct MockDb {
     docs: Mutex<HashMap<String, DocumentRow>>,
     chunks: Mutex<HashMap<String, ChunkRow>>,
+    memories: Mutex<HashMap<String, MemoryRow>>,
 }
 
 impl MockDb {
@@ -22,6 +23,13 @@ impl MockDb {
     }
     pub fn chunk_count(&self) -> usize {
         self.chunks.lock().unwrap().len()
+    }
+    pub fn memory_count(&self) -> usize {
+        self.memories.lock().unwrap().len()
+    }
+    /// Test helper: a clone of a stored memory row by id.
+    pub fn memory(&self, id: &str) -> Option<MemoryRow> {
+        self.memories.lock().unwrap().get(id).cloned()
     }
 }
 
@@ -100,6 +108,23 @@ impl Db for MockDb {
         rows.sort_by_key(|d| std::cmp::Reverse(d.captured_at)); // newest first
         rows.truncate(limit.max(0) as usize);
         Ok(rows)
+    }
+    async fn insert_memories(&self, memories: &[MemoryRow]) -> Result<(), String> {
+        let mut store = self.memories.lock().unwrap();
+        for m in memories {
+            store.entry(m.id.clone()).or_insert_with(|| m.clone());
+        }
+        Ok(())
+    }
+    async fn mark_superseded(&self, pairs: &[(String, String)]) -> Result<(), String> {
+        let mut store = self.memories.lock().unwrap();
+        for (old_id, new_id) in pairs {
+            if let Some(m) = store.get_mut(old_id) {
+                m.is_latest = false;
+                m.superseded_by = Some(new_id.clone());
+            }
+        }
+        Ok(())
     }
 }
 

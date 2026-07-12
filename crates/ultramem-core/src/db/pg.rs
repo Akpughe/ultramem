@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use super::{ChunkRow, Db, DocumentRow};
+use super::{ChunkRow, Db, DocumentRow, MemoryRow};
 
 /// Migrations embedded at compile time from `crates/ultramem-core/migrations/`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -167,6 +167,50 @@ impl Db for PgDb {
             processing_state: r.get("processing_state"),
             created_at: r.get("created_at"),
         }))
+    }
+
+    async fn insert_memories(&self, memories: &[MemoryRow]) -> Result<(), String> {
+        for m in memories {
+            sqlx::query(
+                "insert into memories \
+                 (id, container_tag, kind, statement, confidence, is_latest, needs_review, \
+                  supersedes, superseded_by, extends, event_from, valid_until, learned_at, \
+                  document_id, created_at) \
+                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+                 on conflict (id) do nothing",
+            )
+            .bind(&m.id)
+            .bind(&m.container_tag)
+            .bind(&m.kind)
+            .bind(&m.statement)
+            .bind(m.confidence)
+            .bind(m.is_latest)
+            .bind(m.needs_review)
+            .bind(&m.supersedes)
+            .bind(&m.superseded_by)
+            .bind(&m.extends)
+            .bind(m.event_from)
+            .bind(m.valid_until)
+            .bind(m.learned_at)
+            .bind(&m.document_id)
+            .bind(m.created_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("insert_memories failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    async fn mark_superseded(&self, pairs: &[(String, String)]) -> Result<(), String> {
+        for (old_id, new_id) in pairs {
+            sqlx::query("update memories set is_latest = false, superseded_by = $2 where id = $1")
+                .bind(old_id)
+                .bind(new_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| format!("mark_superseded failed: {e}"))?;
+        }
+        Ok(())
     }
 }
 
