@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use super::{Db, DocumentRow};
+use super::{ChunkRow, Db, DocumentRow};
 
 /// Migrations embedded at compile time from `crates/ultramem-core/migrations/`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -45,14 +45,17 @@ impl Db for PgDb {
     async fn insert_document(&self, d: &DocumentRow) -> Result<(), String> {
         sqlx::query(
             "insert into documents \
-             (id, container_tag, source, title, reference, captured_at, processing_state, created_at) \
-             values ($1,$2,$3,$4,$5,$6,$7,$8) on conflict (id) do nothing",
+             (id, container_tag, source, title, reference, content_hash, canonical_url, \
+              captured_at, processing_state, created_at) \
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) on conflict (id) do nothing",
         )
         .bind(&d.id)
         .bind(&d.container_tag)
         .bind(&d.source)
         .bind(&d.title)
         .bind(&d.reference)
+        .bind(&d.content_hash)
+        .bind(&d.canonical_url)
         .bind(d.captured_at)
         .bind(&d.processing_state)
         .bind(d.created_at)
@@ -62,13 +65,53 @@ impl Db for PgDb {
         Ok(())
     }
 
+    async fn upsert_chunks(&self, chunks: &[ChunkRow]) -> Result<(), String> {
+        for c in chunks {
+            sqlx::query(
+                "insert into chunks (id, document_id, chunk_index, content, embed_model, dim) \
+                 values ($1,$2,$3,$4,$5,$6) on conflict (id) do nothing",
+            )
+            .bind(&c.id)
+            .bind(&c.document_id)
+            .bind(c.chunk_index)
+            .bind(&c.content)
+            .bind(&c.embed_model)
+            .bind(c.dim)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("upsert_chunks failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    async fn find_document_id(
+        &self,
+        container_tag: &str,
+        content_hash: &str,
+        canonical_url: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let row = sqlx::query(
+            "select id from documents \
+             where container_tag = $1 and (content_hash = $2 or ($3 is not null and canonical_url = $3)) \
+             limit 1",
+        )
+        .bind(container_tag)
+        .bind(content_hash)
+        .bind(canonical_url)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("find_document_id failed: {e}"))?;
+        Ok(row.map(|r| r.get::<String, _>("id")))
+    }
+
     async fn get_document(
         &self,
         id: &str,
         container_tag: &str,
     ) -> Result<Option<DocumentRow>, String> {
         let row = sqlx::query(
-            "select id, container_tag, source, title, reference, captured_at, processing_state, created_at \
+            "select id, container_tag, source, title, reference, content_hash, canonical_url, \
+             captured_at, processing_state, created_at \
              from documents where id = $1 and container_tag = $2",
         )
         .bind(id)
@@ -82,6 +125,8 @@ impl Db for PgDb {
             source: r.get("source"),
             title: r.get("title"),
             reference: r.get("reference"),
+            content_hash: r.get("content_hash"),
+            canonical_url: r.get("canonical_url"),
             captured_at: r.get("captured_at"),
             processing_state: r.get("processing_state"),
             created_at: r.get("created_at"),
@@ -114,6 +159,8 @@ mod tests {
                 source: "api".into(),
                 title: "Smoke".into(),
                 reference: String::new(),
+                content_hash: Some("deadbeef".into()),
+                canonical_url: None,
                 captured_at: 1,
                 processing_state: "pending".into(),
                 created_at: 1,
@@ -126,6 +173,28 @@ mod tests {
             assert_eq!(got.as_ref().map(|d| d.id.as_str()), Some(id.as_str()));
             // Tag-scoped: another namespace can't read it.
             assert!(db.get_document(&id, "other").await.expect("get2").is_none());
+            // Chunk dual-write + content-hash dedup.
+            db.upsert_chunks(&[ChunkRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                document_id: id.clone(),
+                chunk_index: 0,
+                content: "chunk text".into(),
+                embed_model: "mock".into(),
+                dim: 3,
+            }])
+            .await
+            .expect("upsert_chunks");
+            assert_eq!(
+                db.find_document_id(&doc.container_tag, "deadbeef", None)
+                    .await
+                    .expect("dedup lookup"),
+                Some(id.clone())
+            );
+            assert!(db
+                .find_document_id(&doc.container_tag, "nomatch", None)
+                .await
+                .expect("dedup miss")
+                .is_none());
         });
     }
 }
