@@ -80,6 +80,27 @@ impl Db for MockDb {
             })
             .map(|d| d.id.clone()))
     }
+    async fn list_documents(
+        &self,
+        container_tag: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<DocumentRow>, String> {
+        let mut rows: Vec<DocumentRow> = self
+            .docs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|d| {
+                d.container_tag == container_tag
+                    && before.map(|b| d.captured_at < b).unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|d| std::cmp::Reverse(d.captured_at)); // newest first
+        rows.truncate(limit.max(0) as usize);
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
