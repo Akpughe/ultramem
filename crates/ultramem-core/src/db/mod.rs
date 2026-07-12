@@ -74,4 +74,13 @@ pub trait Db: Send + Sync {
         content_hash: &str,
         canonical_url: Option<&str>,
     ) -> Result<Option<String>, String>;
+    /// The document registry for a namespace, newest first, for the timeline —
+    /// an indexed query that replaces the full-collection Qdrant scroll. `before`
+    /// (exclusive `captured_at` upper bound) paginates; `limit` caps the page.
+    async fn list_documents(
+        &self,
+        container_tag: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<DocumentRow>, String>;
 }

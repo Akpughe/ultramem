@@ -1638,6 +1638,16 @@ impl MemoryEngine {
         before: Option<i64>,
         limit: usize,
     ) -> Result<Vec<(String, String, String, String, i64)>, String> {
+        // Phase A: when the relational source of truth is attached, read the
+        // registry from an indexed `documents` query instead of scrolling the
+        // whole chunks collection (which silently truncates past ~1k docs).
+        if let Some(db) = &self.db {
+            let docs = db.list_documents(tag, before, limit as i64).await?;
+            return Ok(docs
+                .into_iter()
+                .map(|d| (d.id, d.title, d.source, d.reference, d.captured_at))
+                .collect());
+        }
         let cfg = self.cfg();
         let filter = tagged_filter(None, tag);
         // Cap the scroll generously; dedup collapses it to distinct documents.
@@ -2469,6 +2479,70 @@ mod tests {
         assert_eq!(h.len(), 64);
         assert_eq!(h, content_sha256("hello"));
         assert_ne!(h, content_sha256("hello!"));
+    }
+
+    /// Phase A Task 3: with a Db attached, the document registry / timeline reads
+    /// from the indexed `documents` query (newest-first, `before`-paginated,
+    /// namespace-scoped) instead of scrolling the whole chunks collection.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn timeline_reads_from_pg_when_db_attached() {
+        use crate::db::mock::MockDb;
+        use crate::providers::mock::{MemStore, MockEmbedder};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = EngineCfg::default();
+            cfg.chunks_collection = "c".into();
+            cfg.facts_collection = "f".into();
+            let engine = MemoryEngine::new(cfg)
+                .with_store(Arc::new(MemStore::new()))
+                .with_embedder(Arc::new(MockEmbedder { dim: 8 }))
+                .with_db(Arc::new(MockDb::new()));
+            let mk = |content: &str, captured_at: i64, tag: &str| IngestDoc {
+                source: "api".into(),
+                title: content.into(),
+                content: content.into(),
+                reference: String::new(),
+                app: String::new(),
+                captured_at,
+                file_path: None,
+                container_tag: tag.into(),
+            };
+            engine
+                .add_document(&mk("alpha", 1000, "tenant_x"))
+                .await
+                .unwrap();
+            engine
+                .add_document(&mk("beta", 2000, "tenant_x"))
+                .await
+                .unwrap();
+            engine
+                .add_document(&mk("gamma", 3000, "tenant_y"))
+                .await
+                .unwrap();
+
+            // Only tenant_x's documents, newest first.
+            let rows = engine
+                .list_document_ids("tenant_x", None, 10)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2, "must not include the other tenant");
+            assert_eq!(rows[0].4, 2000, "newest first");
+            assert_eq!(rows[1].4, 1000);
+
+            // `before` paginates (exclusive upper bound on captured_at).
+            let older = engine
+                .list_document_ids("tenant_x", Some(2000), 10)
+                .await
+                .unwrap();
+            assert_eq!(older.len(), 1);
+            assert_eq!(older[0].4, 1000);
+
+            // `limit` caps the page.
+            let one = engine.list_document_ids("tenant_x", None, 1).await.unwrap();
+            assert_eq!(one.len(), 1);
+            assert_eq!(one[0].4, 2000);
+        });
     }
 
     #[test]

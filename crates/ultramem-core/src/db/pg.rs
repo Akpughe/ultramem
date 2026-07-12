@@ -104,6 +104,42 @@ impl Db for PgDb {
         Ok(row.map(|r| r.get::<String, _>("id")))
     }
 
+    async fn list_documents(
+        &self,
+        container_tag: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<DocumentRow>, String> {
+        let rows = sqlx::query(
+            "select id, container_tag, source, title, reference, content_hash, canonical_url, \
+             captured_at, processing_state, created_at \
+             from documents \
+             where container_tag = $1 and ($2::bigint is null or captured_at < $2) \
+             order by captured_at desc limit $3",
+        )
+        .bind(container_tag)
+        .bind(before)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("list_documents failed: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| DocumentRow {
+                id: r.get("id"),
+                container_tag: r.get("container_tag"),
+                source: r.get("source"),
+                title: r.get("title"),
+                reference: r.get("reference"),
+                content_hash: r.get("content_hash"),
+                canonical_url: r.get("canonical_url"),
+                captured_at: r.get("captured_at"),
+                processing_state: r.get("processing_state"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
     async fn get_document(
         &self,
         id: &str,
