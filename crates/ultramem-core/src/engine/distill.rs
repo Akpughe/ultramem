@@ -22,19 +22,23 @@ const MAX_TOTAL_FACTS: usize = 50;
 
 const EXTRACT_SYSTEM: &str = "You extract memories from content captured on a user's computer \
 (their files, clipboard, browsing, and meetings). Extract every distinct fact worth remembering \
-about the user, their work, projects, people, decisions, preferences, and plans. Each fact must \
-stand alone without any surrounding context, e.g. \"The Q3 roadmap prioritizes the mobile app \
-redesign\". Extract as many facts as the content genuinely supports — dense content may yield \
-many, and boilerplate, navigation text, or generic content with nothing personal or \
+about the user, their work, projects, people, decisions, preferences, and plans. Each fact's \
+`statement` must stand alone without any surrounding context, e.g. \"The Q3 roadmap prioritizes \
+the mobile app redesign\". Extract as many facts as the content genuinely supports — dense content \
+may yield many, and boilerplate, navigation text, or generic content with nothing personal or \
 project-specific yields none. When nothing is worth remembering, return []. \
 When a fact describes something that happened (or is scheduled) on a specific date — stated \
 explicitly OR relatively ('yesterday', 'last Sunday', 'two weeks ago', 'next Friday') — resolve \
-it against the Conversation date given below and PREFIX that fact with the absolute event date as \
-\"[on YYYY-MM-DD] \" (e.g. \"[on 2023-05-20] The user visited the Museum of Modern Art\"). This \
+it against the Conversation date given below and PREFIX the statement with the absolute event date \
+as \"[on YYYY-MM-DD] \" (e.g. \"[on 2023-05-20] The user visited the Museum of Modern Art\"). This \
 anchors temporal reasoning; use it whenever a fact has a 'when'. \
 Separately, if (and only if) a fact stops being true after a specific calendar date — a deadline, \
-an appointment, a 'tomorrow'/'next week' item — append \" [until YYYY-MM-DD]\" to that fact string. \
-Respond with ONLY a JSON array of strings.";
+an appointment, a 'tomorrow'/'next week' item — append \" [until YYYY-MM-DD]\" to the statement. \
+For each fact also give a `kind` (one of: preference, personal_fact, project_fact, policy, \
+decision, task, event, claim, quote, relationship) and a `confidence` from 0.0 to 1.0 (how sure \
+you are the fact is accurate and worth remembering). \
+Respond with ONLY a JSON array of objects: \
+[{\"statement\":\"...\",\"kind\":\"...\",\"confidence\":0.0}, ...].";
 
 const MERGE_SYSTEM: &str = "You are given candidate facts extracted from different parts of the \
 same document. Merge near-duplicates into a single best phrasing, drop generic or boilerplate \
@@ -43,16 +47,40 @@ Preserve any leading \"[on YYYY-MM-DD] \" event-date prefix and any trailing \" 
 expiry suffix on the facts that have one. \
 Respond with ONLY a JSON array of strings.";
 
-/// Extract memories from a whole document. Segment → extract per segment →
-/// merge/dedup across segments. Returns an empty vec when the model
-/// (correctly) finds nothing memorable.
-pub async fn distill_facts(
+/// The recognised memory kinds (anything else parses to "unknown").
+const KINDS: &[&str] = &[
+    "preference",
+    "personal_fact",
+    "project_fact",
+    "policy",
+    "decision",
+    "task",
+    "event",
+    "claim",
+    "quote",
+    "relationship",
+];
+
+/// A distilled fact with its type metadata. `statement` still carries any
+/// `[on …]`/`[until …]` conventions (parsed downstream); `kind` is from `KINDS`
+/// (or "unknown"); `confidence` is 0.0–1.0.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistilledFact {
+    pub statement: String,
+    pub kind: String,
+    pub confidence: f32,
+}
+
+/// Extract typed memories from a whole document. Segment → extract per segment →
+/// merge/dedup across segments (the merge dedups on statement text; type
+/// metadata is re-associated by statement, defaulting for any rephrasings).
+pub async fn distill_facts_typed(
     llm: &dyn Llm,
     model: &ResolvedModel,
     title: &str,
     content: &str,
     doc_date: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<DistilledFact>, String> {
     if !model.is_ready() {
         return Err("no model configured for distillation".into());
     }
@@ -69,7 +97,7 @@ pub async fn distill_facts(
     };
     // SS-5: the document body is untrusted; wrap it and tell the model so.
     let system = format!("{EXTRACT_SYSTEM}{}", super::promptguard::UNTRUSTED_NOTE);
-    let mut all: Vec<String> = Vec::new();
+    let mut all: Vec<DistilledFact> = Vec::new();
     let total = segments.len();
     for (i, seg) in segments.iter().enumerate() {
         let user = format!(
@@ -78,7 +106,7 @@ pub async fn distill_facts(
             super::promptguard::wrap_untrusted(seg)
         );
         match llm.chat(model, &system, &user, 0.3).await {
-            Ok(raw) => match parse_facts(&raw, MAX_FACTS_PER_SEGMENT) {
+            Ok(raw) => match parse_typed_facts(&raw, MAX_FACTS_PER_SEGMENT) {
                 Some(facts) => all.extend(facts),
                 None => eprintln!(
                     "[recally] unparseable distill output for '{title}' part {}",
@@ -104,28 +132,58 @@ pub async fn distill_facts(
         return Ok(all);
     }
 
-    // Cross-segment merge: dedup near-duplicates, drop weak ones. On failure
-    // fall back to a local exact-ish dedup — partial quality beats losing the
-    // extraction entirely.
+    // Cross-segment merge on statement text; re-associate type metadata (a
+    // merged statement that exactly matches an original keeps its kind/
+    // confidence, else defaults). On failure, local exact dedup.
+    let meta: std::collections::HashMap<String, DistilledFact> = all
+        .iter()
+        .map(|f| (f.statement.clone(), f.clone()))
+        .collect();
     let listing = all
         .iter()
-        .map(|f| format!("- {f}"))
+        .map(|f| format!("- {}", f.statement))
         .collect::<Vec<_>>()
         .join("\n");
-    match llm.chat(model, MERGE_SYSTEM, &listing, 0.3).await {
-        Ok(raw) => {
-            if let Some(merged) = parse_facts(&raw, MAX_TOTAL_FACTS) {
-                if !merged.is_empty() {
-                    return Ok(merged);
-                }
-            }
-            Ok(local_dedup(all, MAX_TOTAL_FACTS))
-        }
+    let merged_statements = match llm.chat(model, MERGE_SYSTEM, &listing, 0.3).await {
+        Ok(raw) => parse_facts(&raw, MAX_TOTAL_FACTS).filter(|m| !m.is_empty()),
         Err(e) => {
             eprintln!("[recally] fact merge failed for '{title}': {e}");
-            Ok(local_dedup(all, MAX_TOTAL_FACTS))
+            None
         }
-    }
+    };
+    let statements = merged_statements.unwrap_or_else(|| {
+        local_dedup(
+            all.iter().map(|f| f.statement.clone()).collect(),
+            MAX_TOTAL_FACTS,
+        )
+    });
+    Ok(statements
+        .into_iter()
+        .map(|s| {
+            meta.get(&s).cloned().unwrap_or(DistilledFact {
+                statement: s,
+                kind: "unknown".into(),
+                confidence: 0.5,
+            })
+        })
+        .collect())
+}
+
+/// Statement-only distillation (backward-compatible): the same pass as
+/// [`distill_facts_typed`], returning just the fact strings. Used by the
+/// reconcile/reindex/eval paths that key on statement text.
+pub async fn distill_facts(
+    llm: &dyn Llm,
+    model: &ResolvedModel,
+    title: &str,
+    content: &str,
+    doc_date: &str,
+) -> Result<Vec<String>, String> {
+    Ok(distill_facts_typed(llm, model, title, content, doc_date)
+        .await?
+        .into_iter()
+        .map(|f| f.statement)
+        .collect())
 }
 
 /// Dig the facts out of model output. Robust to format drift across providers:
@@ -151,9 +209,10 @@ pub fn parse_facts(raw: &str, cap: usize) -> Option<Vec<String>> {
                     .into_iter()
                     .filter_map(|v| match v {
                         serde_json::Value::String(s) => Some(s),
-                        // {"fact": "..."} / {"text": "..."} / first string field.
+                        // {"statement"|"fact"|"text": "..."} / first string field.
                         serde_json::Value::Object(o) => o
-                            .get("fact")
+                            .get("statement")
+                            .or_else(|| o.get("fact"))
                             .or_else(|| o.get("text"))
                             .and_then(|x| x.as_str())
                             .map(str::to_string)
@@ -187,6 +246,68 @@ pub fn parse_facts(raw: &str, cap: usize) -> Option<Vec<String>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// Parse the typed extractor output into `DistilledFact`s. Tolerant: a bare
+/// string becomes an unknown-kind fact; an object's `kind` is validated against
+/// `KINDS` (else "unknown") and `confidence` clamped to 0..1 (default 0.5). Falls
+/// back to statement-only parsing (via [`parse_facts`]) if no object array is found.
+fn parse_typed_facts(raw: &str, cap: usize) -> Option<Vec<DistilledFact>> {
+    if let (Some(start), Some(end)) = (raw.find('['), raw.rfind(']')) {
+        if end > start {
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&raw[start..=end]) {
+                let facts: Vec<DistilledFact> = arr
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        serde_json::Value::String(s) => Some(DistilledFact {
+                            statement: s,
+                            kind: "unknown".into(),
+                            confidence: 0.5,
+                        }),
+                        serde_json::Value::Object(o) => {
+                            let statement = o
+                                .get("statement")
+                                .or_else(|| o.get("fact"))
+                                .or_else(|| o.get("text"))
+                                .and_then(|x| x.as_str())?
+                                .trim()
+                                .trim_matches('"')
+                                .trim()
+                                .to_string();
+                            let kind = match o.get("kind").and_then(|x| x.as_str()) {
+                                Some(k) if KINDS.contains(&k) => k.to_string(),
+                                _ => "unknown".into(),
+                            };
+                            let confidence = o
+                                .get("confidence")
+                                .and_then(|x| x.as_f64())
+                                .map(|c| c.clamp(0.0, 1.0) as f32)
+                                .unwrap_or(0.5);
+                            Some(DistilledFact {
+                                statement,
+                                kind,
+                                confidence,
+                            })
+                        }
+                        _ => None,
+                    })
+                    .filter(|f| f.statement.len() >= 8)
+                    .take(cap)
+                    .collect();
+                return Some(facts);
+            }
+        }
+    }
+    // Fall back to the string harvester, tagging results as unknown-kind.
+    parse_facts(raw, cap).map(|v| {
+        v.into_iter()
+            .map(|s| DistilledFact {
+                statement: s,
+                kind: "unknown".into(),
+                confidence: 0.5,
+            })
+            .collect()
+    })
+}
+
 /// Case-insensitive exact dedup, preserving first occurrence order.
 fn local_dedup(facts: Vec<String>, cap: usize) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
@@ -200,6 +321,33 @@ fn local_dedup(facts: Vec<String>, cap: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_typed_facts_reads_kind_and_confidence() {
+        let raw = r#"[
+            {"statement":"the user prefers Rust","kind":"preference","confidence":0.9},
+            {"statement":"the deadline is June 20","kind":"task","confidence":1.5},
+            {"statement":"a bare claim with no metadata"},
+            {"statement":"weird kind here","kind":"nonsense","confidence":0.2}
+        ]"#;
+        let facts = parse_typed_facts(raw, 10).unwrap();
+        assert_eq!(facts.len(), 4);
+        assert_eq!(facts[0].kind, "preference");
+        assert_eq!(facts[0].confidence, 0.9);
+        assert_eq!(facts[1].confidence, 1.0, "confidence clamps to 1.0");
+        assert_eq!(facts[2].kind, "unknown", "missing kind defaults");
+        assert_eq!(facts[2].confidence, 0.5);
+        assert_eq!(facts[3].kind, "unknown", "unrecognized kind → unknown");
+    }
+
+    #[test]
+    fn parse_facts_extracts_statement_from_typed_objects() {
+        // The string path still works with the new object shape (picks statement,
+        // not kind — which is alphabetically first among the string fields).
+        let raw = r#"[{"confidence":0.9,"kind":"preference","statement":"the user ships Rust"}]"#;
+        let facts = parse_facts(raw, 10).unwrap();
+        assert_eq!(facts, vec!["the user ships Rust"]);
+    }
 
     /// Injection defense is actually WIRED at the distill sink (SS-5), not just
     /// available in promptguard: the content the model receives is wrapped in
