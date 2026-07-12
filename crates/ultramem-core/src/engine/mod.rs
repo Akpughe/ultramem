@@ -278,6 +278,9 @@ pub struct MemoryEngine {
     ocr: Arc<dyn Ocr>,
     llm: Arc<dyn Llm>,
     store: Arc<dyn VectorStore>,
+    /// Phase A relational source of truth. `None` → Qdrant-only (unchanged
+    /// behavior); `Some` → the engine dual-writes documents/chunks and dedups.
+    db: Option<Arc<dyn crate::db::Db>>,
     cfg: RwLock<EngineCfg>,
     /// Cached standing profile per namespace: tag → (profile, computed_at_unix).
     /// Recompiled lazily when older than `PROFILE_TTL`.
@@ -308,9 +311,18 @@ impl MemoryEngine {
                 cfg.qdrant_url.clone(),
                 cfg.qdrant_api_key.clone(),
             )),
+            db: None,
             cfg: RwLock::new(cfg),
             profile_cache: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Attach the Phase A relational source of truth. When set, ingest
+    /// dual-writes documents/chunks and dedups by content hash / canonical URL.
+    /// The server connects + migrates a `PgDb` at startup and injects it here.
+    pub fn with_db(mut self, db: Arc<dyn crate::db::Db>) -> Self {
+        self.db = Some(db);
+        self
     }
 
     /// Swap the embedder (e.g. a custom provider) without touching engine code.
@@ -502,6 +514,20 @@ impl MemoryEngine {
         // call sees the text. Conservative: credentials only, not ordinary PII.
         let content = redact::scrub(&content);
 
+        // 1c. Phase A dedup: when a relational source of truth is attached,
+        // compute the content hash + canonical URL and skip re-ingest if this
+        // document already exists in the namespace (returns the existing id).
+        let content_hash = content_sha256(&content);
+        let canonical_url = canonicalize_url(&doc.reference);
+        if let Some(db) = &self.db {
+            if let Ok(Some(existing)) = db
+                .find_document_id(doc.tag(), &content_hash, canonical_url.as_deref())
+                .await
+            {
+                return Ok(existing);
+            }
+        }
+
         // 2. Chunk — strategy follows content type (markdown by heading,
         // transcript by speaker turn, else paragraph).
         let chunks = chunker::chunk_doc(
@@ -576,6 +602,11 @@ impl MemoryEngine {
         // 4. Upsert chunks — after this the document is searchable. In hybrid
         // mode each point carries a named `dense` vector plus a `text` sparse
         // vector (term frequencies over the same input the dense side saw).
+        // Chunk ids are pre-generated so a Qdrant point and its PG chunk row
+        // share an id (Phase A dual-write).
+        let chunk_ids: Vec<String> = (0..chunks.len())
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect();
         let points: Vec<Value> = chunks
             .iter()
             .zip(vectors.iter())
@@ -588,7 +619,7 @@ impl MemoryEngine {
                     json!(vec)
                 };
                 json!({
-                    "id": uuid::Uuid::new_v4().to_string(),
+                    "id": chunk_ids[i],
                     "vector": vector,
                     "payload": {
                         "doc_id": doc_id,
@@ -605,6 +636,48 @@ impl MemoryEngine {
             })
             .collect();
         self.store.upsert(&cfg.chunks_collection, points).await?;
+
+        // 4b. Phase A dual-write: mirror the document + chunk rows into the
+        // relational source of truth. Non-fatal (Qdrant already has the data);
+        // a rebuild-index/backfill job reconciles any drift.
+        if let Some(db) = &self.db {
+            let now = chrono::Utc::now().timestamp();
+            let doc_row = crate::db::DocumentRow {
+                id: doc_id.clone(),
+                container_tag: doc.tag().to_string(),
+                source: doc.source.clone(),
+                title: doc.title.clone(),
+                reference: doc.reference.clone(),
+                content_hash: Some(content_hash.clone()),
+                canonical_url: canonical_url.clone(),
+                captured_at: doc.captured_at,
+                processing_state: "chunked".into(),
+                created_at: now,
+            };
+            let chunk_rows: Vec<crate::db::ChunkRow> = chunks
+                .iter()
+                .enumerate()
+                .map(|(i, c)| crate::db::ChunkRow {
+                    id: chunk_ids[i].clone(),
+                    document_id: doc_id.clone(),
+                    chunk_index: i as i32,
+                    content: c.clone(),
+                    embed_model: self.embedder.id().to_string(),
+                    dim: self.embedder.dim() as i32,
+                })
+                .collect();
+            if let Err(e) = db.insert_document(&doc_row).await {
+                eprintln!(
+                    "[ultramem] pg insert_document failed for '{}': {e}",
+                    doc.title
+                );
+            } else if let Err(e) = db.upsert_chunks(&chunk_rows).await {
+                eprintln!(
+                    "[ultramem] pg upsert_chunks failed for '{}': {e}",
+                    doc.title
+                );
+            }
+        }
 
         // 5. Index memories. Tiny captures carry no facts beyond their own text
         // (already embedded), so distillation is skipped for them.
@@ -1821,6 +1894,48 @@ fn date_str(unix: i64) -> String {
         .unwrap_or_default()
 }
 
+/// Hex sha256 of the (scrubbed) document text — the doc-level dedup key.
+fn content_sha256(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(content.as_bytes());
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Normalize a reference URL for dedup: drop tracking query params
+/// (`utm_*`, `fbclid`, `gclid`, `mc_eid`, `ref`), lowercase the host, drop the
+/// fragment. Returns `None` when the reference isn't an http(s) URL (e.g. a file
+/// path) — dedup then relies on the content hash alone.
+fn canonicalize_url(reference: &str) -> Option<String> {
+    let mut u = url::Url::parse(reference).ok()?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return None;
+    }
+    let kept: Vec<(String, String)> = u
+        .query_pairs()
+        .filter(|(k, _)| {
+            let k = k.to_ascii_lowercase();
+            !(k.starts_with("utm_") || matches!(k.as_str(), "fbclid" | "gclid" | "mc_eid" | "ref"))
+        })
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    u.set_fragment(None);
+    {
+        let mut qp = u.query_pairs_mut();
+        qp.clear();
+        for (k, v) in &kept {
+            qp.append_pair(k, v);
+        }
+    }
+    if u.query() == Some("") {
+        u.set_query(None);
+    }
+    Some(u.to_string())
+}
+
 /// A readable one-line statement for a knowledge-graph edge — embedded for
 /// answer-time semantic lookup and shown in the resolved block.
 fn edge_statement(e: &graph::Edge) -> String {
@@ -2275,6 +2390,85 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// Phase A Task 2: with a Db attached, ingest dual-writes the document +
+    /// chunks to the relational store, and identical content re-ingested (even
+    /// with a different tracking param) is deduped to the same id — but a
+    /// different tenant with the same content is NOT deduped. Offline (mock
+    /// store + mock embedder + mock db).
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn dual_write_and_dedup_on_ingest() {
+        use crate::db::mock::MockDb;
+        use crate::db::Db;
+        use crate::providers::mock::{MemStore, MockEmbedder};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = EngineCfg::default();
+            cfg.chunks_collection = "c".into();
+            cfg.facts_collection = "f".into();
+            let store = Arc::new(MemStore::new());
+            let db = Arc::new(MockDb::new());
+            let engine = MemoryEngine::new(cfg)
+                .with_store(store.clone())
+                .with_embedder(Arc::new(MockEmbedder { dim: 8 }))
+                .with_db(db.clone());
+            let mk = |reference: &str, tag: &str| IngestDoc {
+                source: "api".into(),
+                title: "T".into(),
+                content: "a short rust note".into(), // <280 → distill skipped
+                reference: reference.into(),
+                app: String::new(),
+                captured_at: 1_000,
+                file_path: None,
+                container_tag: tag.into(),
+            };
+
+            let id1 = engine
+                .add_document(&mk("https://x.com/a?utm_source=twitter", "tenant_x"))
+                .await
+                .unwrap();
+            assert_eq!(db.document_count(), 1, "document dual-written to PG");
+            assert!(db.chunk_count() >= 1, "chunks dual-written to PG");
+            assert!(store.count("c") >= 1, "chunks also in the vector store");
+            assert!(db.get_document(&id1, "tenant_x").await.unwrap().is_some());
+
+            // Identical content, different tracking param → deduped to the same id.
+            let id2 = engine
+                .add_document(&mk("https://x.com/a?utm_source=news", "tenant_x"))
+                .await
+                .unwrap();
+            assert_eq!(id2, id1, "identical content should dedup");
+            assert_eq!(db.document_count(), 1, "no duplicate document row");
+
+            // Same content, DIFFERENT tenant → not deduped (namespace isolation).
+            let id3 = engine
+                .add_document(&mk("https://x.com/a", "tenant_y"))
+                .await
+                .unwrap();
+            assert_ne!(id3, id1);
+            assert_eq!(db.document_count(), 2);
+        });
+    }
+
+    #[test]
+    fn canonicalize_url_strips_tracking_and_matches() {
+        // Tracking params dropped; the same page with different utm dedups equal.
+        let a = canonicalize_url("https://x.com/a?utm_source=twitter&id=7#frag");
+        let b = canonicalize_url("https://x.com/a?utm_source=news&id=7");
+        assert_eq!(a, b);
+        assert!(a.unwrap().contains("id=7"));
+        // Non-URL references (file paths) → None (dedup falls back to hash).
+        assert!(canonicalize_url("/tmp/report.pdf").is_none());
+    }
+
+    #[test]
+    fn content_sha256_is_stable_and_hex() {
+        let h = content_sha256("hello");
+        assert_eq!(h.len(), 64);
+        assert_eq!(h, content_sha256("hello"));
+        assert_ne!(h, content_sha256("hello!"));
     }
 
     #[test]

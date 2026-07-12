@@ -13,8 +13,27 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::{Llm, VectorStore};
+use super::{EmbedTask, Embedder, Llm, VectorStore};
 use crate::llm::ResolvedModel;
+
+/// A deterministic embedder that returns fixed-dimension zero vectors — enough
+/// for offline ingest tests that don't exercise similarity.
+pub struct MockEmbedder {
+    pub dim: usize,
+}
+
+#[async_trait]
+impl Embedder for MockEmbedder {
+    async fn embed(&self, _task: EmbedTask, inputs: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        Ok(inputs.iter().map(|_| vec![0.0; self.dim]).collect())
+    }
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn id(&self) -> &str {
+        "mock-embedder"
+    }
+}
 
 /// An `Llm` that records every prompt it receives and returns a canned response.
 /// Lets a test assert what actually reached the model — e.g. that ingested

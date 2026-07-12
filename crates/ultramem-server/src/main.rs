@@ -46,7 +46,26 @@ async fn main() {
             "[ultramem] WARNING: ULTRAMEM_DEV=1 and no keys — the API is UNAUTHENTICATED (dev only)."
         );
     }
-    let engine = MemoryEngine::new(EngineCfg::from_env());
+    let cfg = EngineCfg::from_env();
+    let mut engine = MemoryEngine::new(cfg.clone());
+    // Phase A: attach the Postgres source of truth when configured. Connect +
+    // migrate at startup; a failure logs and falls back to Qdrant-only rather
+    // than blocking the server.
+    if let Some(pg_url) = &cfg.pg_url {
+        use ultramem_core::db::Db;
+        match ultramem_core::db::PgDb::connect(pg_url).await {
+            Ok(db) => match db.migrate().await {
+                Ok(()) => {
+                    engine = engine.with_db(std::sync::Arc::new(db));
+                    println!("[ultramem] Postgres source of truth attached (dual-write enabled)");
+                }
+                Err(e) => eprintln!("[ultramem] WARNING: pg migrate failed ({e}); running Qdrant-only"),
+            },
+            Err(e) => eprintln!(
+                "[ultramem] WARNING: ULTRAMEM_PG_URL set but connect failed ({e}); running Qdrant-only"
+            ),
+        }
+    }
     // Qdrant may still be starting (e.g. `docker compose up` boots both at once),
     // so retry rather than give up — collections must exist before the first write.
     let mut ensured = false;

@@ -5,11 +5,12 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::{Db, DocumentRow};
+use super::{ChunkRow, Db, DocumentRow};
 
 #[derive(Default)]
 pub struct MockDb {
     docs: Mutex<HashMap<String, DocumentRow>>,
+    chunks: Mutex<HashMap<String, ChunkRow>>,
 }
 
 impl MockDb {
@@ -18,6 +19,9 @@ impl MockDb {
     }
     pub fn document_count(&self) -> usize {
         self.docs.lock().unwrap().len()
+    }
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.lock().unwrap().len()
     }
 }
 
@@ -51,6 +55,31 @@ impl Db for MockDb {
             .filter(|d| d.container_tag == container_tag)
             .cloned())
     }
+    async fn upsert_chunks(&self, chunks: &[ChunkRow]) -> Result<(), String> {
+        let mut store = self.chunks.lock().unwrap();
+        for c in chunks {
+            store.entry(c.id.clone()).or_insert_with(|| c.clone());
+        }
+        Ok(())
+    }
+    async fn find_document_id(
+        &self,
+        container_tag: &str,
+        content_hash: &str,
+        canonical_url: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        Ok(self
+            .docs
+            .lock()
+            .unwrap()
+            .values()
+            .find(|d| {
+                d.container_tag == container_tag
+                    && (d.content_hash.as_deref() == Some(content_hash)
+                        || (canonical_url.is_some() && d.canonical_url.as_deref() == canonical_url))
+            })
+            .map(|d| d.id.clone()))
+    }
 }
 
 #[cfg(test)]
@@ -64,6 +93,8 @@ mod tests {
             source: "api".into(),
             title: "T".into(),
             reference: String::new(),
+            content_hash: Some(format!("hash-of-{id}")),
+            canonical_url: None,
             captured_at: 1,
             processing_state: "pending".into(),
             created_at: 1,
@@ -85,6 +116,32 @@ mod tests {
             // Tag isolation: another namespace can't read it.
             assert!(db.get_document("d1", "other").await.unwrap().is_none());
             assert!(db.get_document("missing", "t").await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn dedup_lookup_matches_hash_within_tag() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = MockDb::new();
+            db.insert_document(&doc("d1", "t")).await.unwrap();
+            // Same hash, same tag → dedup hit.
+            assert_eq!(
+                db.find_document_id("t", "hash-of-d1", None).await.unwrap(),
+                Some("d1".into())
+            );
+            // Same hash, different tag → miss (no cross-tenant dedup).
+            assert!(db
+                .find_document_id("other", "hash-of-d1", None)
+                .await
+                .unwrap()
+                .is_none());
+            // Unknown hash → miss.
+            assert!(db
+                .find_document_id("t", "nope", None)
+                .await
+                .unwrap()
+                .is_none());
         });
     }
 }

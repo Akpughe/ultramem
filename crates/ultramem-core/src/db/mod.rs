@@ -18,8 +18,8 @@ pub use pg::PgDb;
 #[cfg(test)]
 pub mod mock;
 
-/// One document row. A subset of the `documents` table — the fields Task 1 needs;
-/// it grows as later slices dual-write chunks/memories/evidence.
+/// One document row. A subset of the `documents` table — the fields the current
+/// slices need; it grows as later slices dual-write memories/evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentRow {
     pub id: String,
@@ -27,9 +27,24 @@ pub struct DocumentRow {
     pub source: String,
     pub title: String,
     pub reference: String,
+    /// sha256 of the (scrubbed) extracted text — the doc-level dedup key.
+    pub content_hash: Option<String>,
+    /// Normalized reference URL (tracking params stripped) — the other dedup key.
+    pub canonical_url: Option<String>,
     pub captured_at: i64,
     pub processing_state: String,
     pub created_at: i64,
+}
+
+/// One chunk row (mirrors the embedded chunk; `id` equals the Qdrant point id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkRow {
+    pub id: String,
+    pub document_id: String,
+    pub chunk_index: i32,
+    pub content: String,
+    pub embed_model: String,
+    pub dim: i32,
 }
 
 /// The relational source of truth. Connection state lives in the impl; the engine
@@ -48,4 +63,15 @@ pub trait Db: Send + Sync {
         id: &str,
         container_tag: &str,
     ) -> Result<Option<DocumentRow>, String>;
+    /// Insert chunk rows (idempotent by id).
+    async fn upsert_chunks(&self, chunks: &[ChunkRow]) -> Result<(), String>;
+    /// Doc-level dedup: return an existing document id in `container_tag` whose
+    /// `content_hash` matches, or whose `canonical_url` matches (when provided) —
+    /// so a re-capture of identical text or the same page isn't re-ingested.
+    async fn find_document_id(
+        &self,
+        container_tag: &str,
+        content_hash: &str,
+        canonical_url: Option<&str>,
+    ) -> Result<Option<String>, String>;
 }
