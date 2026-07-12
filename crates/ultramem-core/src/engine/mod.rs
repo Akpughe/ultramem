@@ -882,9 +882,14 @@ impl MemoryEngine {
         // (`needs_review=true`), held out of active retrieval until reviewed.
         let fact_vec: std::collections::HashMap<&str, &Vec<f32>> =
             facts.iter().map(|s| s.as_str()).zip(fvecs.iter()).collect();
+        let now = chrono::Utc::now().timestamp();
         let mut plain_points: Vec<Value> = Vec::new();
         let mut supersede_points: Vec<Value> = Vec::new();
         let mut superseded: Vec<String> = Vec::new();
+        // Phase A: typed memory rows to dual-write, and (old_id, new_id) pairs to
+        // mirror supersessions. Built only when a Db is attached.
+        let mut mem_rows: Vec<crate::db::MemoryRow> = Vec::new();
+        let mut supersede_pairs: Vec<(String, String)> = Vec::new();
         for action in &actions {
             if action.relation == memory::Relation::Duplicate {
                 continue;
@@ -893,8 +898,10 @@ impl MemoryEngine {
                 continue;
             };
             let needs_review = action.relation == memory::Relation::NeedsReview;
+            let mem_id = uuid::Uuid::new_v4().to_string();
+            let valid_until = expiry.get(action.fact.as_str()).copied().flatten();
             let point = json!({
-                "id": uuid::Uuid::new_v4().to_string(),
+                "id": mem_id,
                 "vector": vec,
                 "payload": {
                     "doc_id": doc_id,
@@ -907,12 +914,34 @@ impl MemoryEngine {
                     "kind": "fact",
                     "supersedes": action.supersedes,
                     "extends": action.extends,
-                    "valid_until": expiry.get(action.fact.as_str()).copied().flatten(),
+                    "valid_until": valid_until,
                     "container_tag": doc.tag(),
                 },
             });
+            if self.db.is_some() {
+                mem_rows.push(crate::db::MemoryRow {
+                    id: mem_id.clone(),
+                    container_tag: doc.tag().to_string(),
+                    kind: "unknown".into(), // typed extraction lands in Task 4b
+                    statement: action.fact.clone(),
+                    confidence: None,
+                    is_latest: true,
+                    needs_review,
+                    supersedes: action.supersedes.clone(),
+                    superseded_by: None,
+                    extends: action.extends.clone(),
+                    event_from: None,
+                    valid_until,
+                    learned_at: now,
+                    document_id: doc_id.to_string(),
+                    created_at: now,
+                });
+            }
             if let Some(old) = &action.supersedes {
                 superseded.push(old.clone());
+                if self.db.is_some() {
+                    supersede_pairs.push((old.clone(), mem_id.clone()));
+                }
                 supersede_points.push(point);
             } else {
                 plain_points.push(point);
@@ -959,6 +988,22 @@ impl MemoryEngine {
                     superseded.len(),
                     supersede_points.len()
                 ));
+            }
+        }
+
+        // Phase A dual-write: mirror the typed memory rows + supersessions into
+        // the relational source of truth (only after the Qdrant writes above
+        // succeed). Non-fatal — a rebuild/backfill reconciles any drift.
+        if let Some(db) = &self.db {
+            if !mem_rows.is_empty() {
+                if let Err(e) = db.insert_memories(&mem_rows).await {
+                    eprintln!("[ultramem] pg insert_memories failed: {e}");
+                }
+            }
+            if !supersede_pairs.is_empty() {
+                if let Err(e) = db.mark_superseded(&supersede_pairs).await {
+                    eprintln!("[ultramem] pg mark_superseded failed: {e}");
+                }
             }
         }
         Ok(())
@@ -2542,6 +2587,47 @@ mod tests {
             let one = engine.list_document_ids("tenant_x", None, 1).await.unwrap();
             assert_eq!(one.len(), 1);
             assert_eq!(one[0].4, 2000);
+        });
+    }
+
+    /// Phase A Task 4a: when a Db is attached, a distilled fact is dual-written
+    /// as a typed memory row alongside the Qdrant fact point. Offline via a
+    /// capturing LLM (returns a canned facts array), mock store/embedder/db.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn memory_rows_dual_written_to_pg() {
+        use crate::db::mock::MockDb;
+        use crate::providers::mock::{CapturingLlm, MemStore, MockEmbedder};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = EngineCfg::default();
+            cfg.chunks_collection = "c".into();
+            cfg.facts_collection = "f".into();
+            cfg.distill_model = crate::llm::ResolvedModel::groq("k", "m"); // ready
+            let db = Arc::new(MockDb::new());
+            let engine = MemoryEngine::new(cfg)
+                .with_store(Arc::new(MemStore::new()))
+                .with_embedder(Arc::new(MockEmbedder { dim: 8 }))
+                .with_llm(Arc::new(CapturingLlm::new(
+                    r#"["the user prefers Rust for backend work"]"#,
+                )))
+                .with_db(db.clone());
+            let doc = IngestDoc {
+                source: "api".into(),
+                title: "Notes".into(),
+                // >= 280 chars so distillation runs.
+                content: "Engineering notes for the week. ".repeat(12),
+                reference: String::new(),
+                app: String::new(),
+                captured_at: 1_000,
+                file_path: None,
+                container_tag: "tenant_x".into(),
+            };
+            engine.add_document(&doc).await.unwrap();
+            assert!(
+                db.memory_count() >= 1,
+                "a distilled fact should be dual-written as a memory row"
+            );
         });
     }
 
