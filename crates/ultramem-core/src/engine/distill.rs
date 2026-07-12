@@ -35,10 +35,12 @@ anchors temporal reasoning; use it whenever a fact has a 'when'. \
 Separately, if (and only if) a fact stops being true after a specific calendar date — a deadline, \
 an appointment, a 'tomorrow'/'next week' item — append \" [until YYYY-MM-DD]\" to the statement. \
 For each fact also give a `kind` (one of: preference, personal_fact, project_fact, policy, \
-decision, task, event, claim, quote, relationship) and a `confidence` from 0.0 to 1.0 (how sure \
-you are the fact is accurate and worth remembering). \
+decision, task, event, claim, quote, relationship), a `confidence` from 0.0 to 1.0 (how sure you \
+are the fact is accurate and worth remembering), and `evidence`: a SHORT VERBATIM span copied \
+exactly from the content above that supports the fact (copy it character-for-character; do not \
+paraphrase; use \"\" if no single span supports it). \
 Respond with ONLY a JSON array of objects: \
-[{\"statement\":\"...\",\"kind\":\"...\",\"confidence\":0.0}, ...].";
+[{\"statement\":\"...\",\"kind\":\"...\",\"confidence\":0.0,\"evidence\":\"...\"}, ...].";
 
 const MERGE_SYSTEM: &str = "You are given candidate facts extracted from different parts of the \
 same document. Merge near-duplicates into a single best phrasing, drop generic or boilerplate \
@@ -63,12 +65,14 @@ const KINDS: &[&str] = &[
 
 /// A distilled fact with its type metadata. `statement` still carries any
 /// `[on …]`/`[until …]` conventions (parsed downstream); `kind` is from `KINDS`
-/// (or "unknown"); `confidence` is 0.0–1.0.
+/// (or "unknown"); `confidence` is 0.0–1.0; `evidence` is a verbatim span the
+/// model copied from the source (validated against a chunk before it's stored).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DistilledFact {
     pub statement: String,
     pub kind: String,
     pub confidence: f32,
+    pub evidence: String,
 }
 
 /// Extract typed memories from a whole document. Segment → extract per segment →
@@ -164,6 +168,7 @@ pub async fn distill_facts_typed(
                 statement: s,
                 kind: "unknown".into(),
                 confidence: 0.5,
+                evidence: String::new(),
             })
         })
         .collect())
@@ -261,6 +266,7 @@ fn parse_typed_facts(raw: &str, cap: usize) -> Option<Vec<DistilledFact>> {
                             statement: s,
                             kind: "unknown".into(),
                             confidence: 0.5,
+                            evidence: String::new(),
                         }),
                         serde_json::Value::Object(o) => {
                             let statement = o
@@ -281,10 +287,16 @@ fn parse_typed_facts(raw: &str, cap: usize) -> Option<Vec<DistilledFact>> {
                                 .and_then(|x| x.as_f64())
                                 .map(|c| c.clamp(0.0, 1.0) as f32)
                                 .unwrap_or(0.5);
+                            let evidence = o
+                                .get("evidence")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or_default()
+                                .to_string();
                             Some(DistilledFact {
                                 statement,
                                 kind,
                                 confidence,
+                                evidence,
                             })
                         }
                         _ => None,
@@ -303,6 +315,7 @@ fn parse_typed_facts(raw: &str, cap: usize) -> Option<Vec<DistilledFact>> {
                 statement: s,
                 kind: "unknown".into(),
                 confidence: 0.5,
+                evidence: String::new(),
             })
             .collect()
     })

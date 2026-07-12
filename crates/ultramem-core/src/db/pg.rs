@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use super::{ChunkRow, Db, DocumentRow, MemoryRow};
+use super::{ChunkRow, Db, DocumentRow, EvidenceRow, MemoryRow};
 
 /// Migrations embedded at compile time from `crates/ultramem-core/migrations/`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -209,6 +209,28 @@ impl Db for PgDb {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| format!("mark_superseded failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    async fn insert_evidence(&self, rows: &[EvidenceRow]) -> Result<(), String> {
+        for e in rows {
+            sqlx::query(
+                "insert into memory_evidence \
+                 (id, memory_id, document_id, chunk_id, char_start, char_end, quote, extractor) \
+                 values ($1,$2,$3,$4,$5,$6,$7,$8) on conflict (id) do nothing",
+            )
+            .bind(&e.id)
+            .bind(&e.memory_id)
+            .bind(&e.document_id)
+            .bind(&e.chunk_id)
+            .bind(e.char_start)
+            .bind(e.char_end)
+            .bind(&e.quote)
+            .bind(&e.extractor)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| format!("insert_evidence failed: {err}"))?;
         }
         Ok(())
     }
