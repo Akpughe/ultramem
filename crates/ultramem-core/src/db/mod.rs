@@ -99,6 +99,17 @@ pub struct JobRow {
     pub updated_at: i64,
 }
 
+/// A forensic audit record of a mutating operation (id is DB-generated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEvent {
+    pub actor: String,
+    pub container_tag: Option<String>,
+    pub action: String,
+    pub target_id: Option<String>,
+    pub request_id: Option<String>,
+    pub ts: i64,
+}
+
 /// The relational source of truth. Connection state lives in the impl; the engine
 /// holds an `Option<Arc<dyn Db>>` and uses it only when configured.
 #[async_trait]
@@ -164,4 +175,8 @@ pub trait Db: Send + Sync {
     ) -> Result<(), String>;
     /// Fetch a job by id, scoped to its namespace (`None` if absent/other-tenant).
     async fn get_job(&self, id: &str, container_tag: &str) -> Result<Option<JobRow>, String>;
+    /// Append a forensic audit event.
+    async fn insert_audit(&self, event: &AuditEvent) -> Result<(), String>;
+    /// Count audit events for a namespace (for tests/inspection).
+    async fn audit_count(&self, container_tag: &str) -> Result<i64, String>;
 }

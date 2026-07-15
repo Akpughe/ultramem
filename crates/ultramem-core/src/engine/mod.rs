@@ -1442,6 +1442,25 @@ impl MemoryEngine {
         db.get_job(id, tag).await.ok().flatten()
     }
 
+    /// Append a forensic audit event for a mutating operation (no-op without a
+    /// Db; non-fatal). `actor` is the acting namespace (`tag`) — a Phase-A proxy
+    /// until credentials carry a stable principal id.
+    pub async fn audit(&self, tag: &str, action: &str, target_id: Option<&str>) {
+        if let Some(db) = &self.db {
+            let event = crate::db::AuditEvent {
+                actor: tag.to_string(),
+                container_tag: Some(tag.to_string()),
+                action: action.to_string(),
+                target_id: target_id.map(String::from),
+                request_id: None,
+                ts: chrono::Utc::now().timestamp(),
+            };
+            if let Err(e) = db.insert_audit(&event).await {
+                eprintln!("[ultramem] audit failed: {e}");
+            }
+        }
+    }
+
     /// Expose the search plan so callers can route enumeration ("list all
     /// files from last week") to the structured timeline instead of semantic
     /// search, which only ever returns a similarity top-K.
@@ -2915,6 +2934,32 @@ mod tests {
                 MemoryEngine::new(EngineCfg::default()).with_store(Arc::new(MemStore::new()));
             assert!(!bare.has_db());
             assert!(bare.job_create("t", "k", 1).await.is_none());
+        });
+    }
+
+    /// Phase A Task 6b: mutating operations record forensic audit events, scoped
+    /// to the acting namespace. No Db → no-op (never panics). Offline.
+    #[test]
+    fn audit_records_scoped_events() {
+        use crate::db::mock::MockDb;
+        use crate::db::Db;
+        use crate::providers::mock::MemStore;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = Arc::new(MockDb::new());
+            let engine = MemoryEngine::new(EngineCfg::default())
+                .with_store(Arc::new(MemStore::new()))
+                .with_db(db.clone());
+            engine.audit("t", "ingest", Some("doc-1")).await;
+            engine.audit("t", "delete", Some("doc-1")).await;
+            engine.audit("other", "ingest", Some("d2")).await;
+            assert_eq!(db.audit_count("t").await.unwrap(), 2);
+            assert_eq!(db.audit_count("other").await.unwrap(), 1);
+
+            // No Db → no-op, no panic.
+            let bare =
+                MemoryEngine::new(EngineCfg::default()).with_store(Arc::new(MemStore::new()));
+            bare.audit("t", "ingest", None).await;
         });
     }
 
