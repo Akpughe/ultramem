@@ -234,6 +234,69 @@ impl Db for PgDb {
         }
         Ok(())
     }
+
+    async fn memories_by_statement(
+        &self,
+        container_tag: &str,
+        statements: &[String],
+    ) -> Result<Vec<MemoryRow>, String> {
+        let rows = sqlx::query(
+            "select id, container_tag, kind, statement, confidence, is_latest, needs_review, \
+             supersedes, superseded_by, extends, event_from, valid_until, learned_at, \
+             document_id, created_at \
+             from memories \
+             where container_tag = $1 and is_latest = true and statement = any($2)",
+        )
+        .bind(container_tag)
+        .bind(statements)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("memories_by_statement failed: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| MemoryRow {
+                id: r.get("id"),
+                container_tag: r.get("container_tag"),
+                kind: r.get("kind"),
+                statement: r.get("statement"),
+                confidence: r.get("confidence"),
+                is_latest: r.get("is_latest"),
+                needs_review: r.get("needs_review"),
+                supersedes: r.get("supersedes"),
+                superseded_by: r.get("superseded_by"),
+                extends: r.get("extends"),
+                event_from: r.get("event_from"),
+                valid_until: r.get("valid_until"),
+                learned_at: r.get("learned_at"),
+                document_id: r.get("document_id"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
+    async fn evidence_for(&self, memory_ids: &[String]) -> Result<Vec<EvidenceRow>, String> {
+        let rows = sqlx::query(
+            "select id, memory_id, document_id, chunk_id, char_start, char_end, quote, extractor \
+             from memory_evidence where memory_id = any($1)",
+        )
+        .bind(memory_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("evidence_for failed: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| EvidenceRow {
+                id: r.get("id"),
+                memory_id: r.get("memory_id"),
+                document_id: r.get("document_id"),
+                chunk_id: r.get("chunk_id"),
+                char_start: r.get("char_start"),
+                char_end: r.get("char_end"),
+                quote: r.get("quote"),
+                extractor: r.get("extractor"),
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]

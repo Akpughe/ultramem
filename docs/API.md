@@ -79,9 +79,18 @@ Upload size cap: 32 MB.
       "chunks": [ { "content": "…", "score": 0.0 } ],
       "metadata": { "source": "…", "reference": "…", "captured_at": 0 } }
   ],
-  "memories": [ "distilled fact (latest, non-expired)", … ]
+  "memories": [ "distilled fact (latest, non-expired)", … ],
+  "provenance": [
+    { "statement": "…", "kind": "preference", "confidence": 0.9,
+      "evidence": [ { "quote": "…verbatim source span…", "documentId": "…", "chunkId": "…" } ] }
+  ]
 }
 ```
+
+> **`provenance`** (Phase A) enriches each returned memory with its `kind`, `confidence`, and
+> grounded `evidence` (verbatim source quotes + their document/chunk), joined from the relational
+> source of truth by statement. It is **additive** — `memories` stays a plain string array — and is
+> **empty unless `ULTRAMEM_PG_URL` is configured**.
 Maps to `MemoryEngine::retrieve_tagged` (planner + multi-query + rerank + `is_latest`/`valid_until` filtering).
 
 > **Field casing:** the top-level keys are snake_case (`documents`, `memories`), but each document object inside `documents` is serialized **camelCase** — `documentId`, `title`, `metadata`, `chunks`, and within `metadata`: `capturedAt`, `source`, `reference`. See the worked example below for the exact shape.

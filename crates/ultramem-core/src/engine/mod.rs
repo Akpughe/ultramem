@@ -269,6 +269,32 @@ pub struct SearchResult {
     pub chunks: Vec<SearchChunk>,
 }
 
+/// A retrieved memory with its provenance (Phase A Task 5), assembled from the
+/// relational source of truth. `kind`/`confidence`/`evidence` are `None`/empty
+/// when no Db is attached.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryProvenance {
+    pub statement: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub evidence: Vec<EvidenceItem>,
+}
+
+/// One grounded evidence span for a memory: the verbatim source quote and where
+/// it came from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceItem {
+    pub quote: String,
+    pub document_id: String,
+    #[serde(default)]
+    pub chunk_id: Option<String>,
+}
+
 pub struct MemoryEngine {
     /// Kept only for Jina **Reader** file/URL extraction (`extract.rs`) — text
     /// extraction, distinct from the embedder/OCR providers.
@@ -1326,6 +1352,48 @@ impl MemoryEngine {
         let plan = self.plan_query(q, context).await;
         self.retrieve_for_plan_tagged(tag, q, &plan, context, limit)
             .await
+    }
+
+    /// Provenance (kind/confidence/evidence) for a set of retrieved memory
+    /// statements, from the relational source of truth. Empty when no Db is
+    /// attached. The statement is the join key — a retrieved fact string equals
+    /// its `memories.statement`. Only current (is_latest) memories are returned.
+    pub async fn memory_provenance(
+        &self,
+        tag: &str,
+        statements: &[String],
+    ) -> Vec<MemoryProvenance> {
+        let Some(db) = &self.db else {
+            return Vec::new();
+        };
+        if statements.is_empty() {
+            return Vec::new();
+        }
+        let rows = db
+            .memories_by_statement(tag, statements)
+            .await
+            .unwrap_or_default();
+        let ids: Vec<String> = rows.iter().map(|m| m.id.clone()).collect();
+        let evidence = db.evidence_for(&ids).await.unwrap_or_default();
+        rows.into_iter()
+            .map(|m| {
+                let ev = evidence
+                    .iter()
+                    .filter(|e| e.memory_id == m.id)
+                    .map(|e| EvidenceItem {
+                        quote: e.quote.clone(),
+                        document_id: e.document_id.clone(),
+                        chunk_id: e.chunk_id.clone(),
+                    })
+                    .collect();
+                MemoryProvenance {
+                    statement: m.statement,
+                    kind: Some(m.kind),
+                    confidence: m.confidence,
+                    evidence: ev,
+                }
+            })
+            .collect()
     }
 
     /// Expose the search plan so callers can route enumeration ("list all
@@ -2709,6 +2777,58 @@ mod tests {
             assert_eq!(ev[0].memory_id, mems[0].id);
             assert!(ev[0].quote.contains("Engineering notes for the week"));
             assert!(ev[0].chunk_id.is_some(), "evidence is tied to a chunk");
+        });
+    }
+
+    /// Phase A Task 5: after ingest, memory_provenance joins the retrieved
+    /// statement back to its kind/confidence and grounded evidence in Postgres.
+    /// No Db → empty. Offline via mocks.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn memory_provenance_joins_kind_confidence_evidence() {
+        use crate::db::mock::MockDb;
+        use crate::providers::mock::{CapturingLlm, MemStore, MockEmbedder};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = EngineCfg::default();
+            cfg.chunks_collection = "c".into();
+            cfg.facts_collection = "f".into();
+            cfg.distill_model = crate::llm::ResolvedModel::groq("k", "m");
+            let db = Arc::new(MockDb::new());
+            let engine = MemoryEngine::new(cfg)
+                .with_store(Arc::new(MemStore::new()))
+                .with_embedder(Arc::new(MockEmbedder { dim: 8 }))
+                .with_llm(Arc::new(CapturingLlm::new(
+                    r#"[{"statement":"the user prefers Rust for backend work","kind":"preference","confidence":0.9,"evidence":"Engineering notes for the week"}]"#,
+                )))
+                .with_db(db.clone());
+            let doc = IngestDoc {
+                source: "api".into(),
+                title: "Notes".into(),
+                content: "Engineering notes for the week. ".repeat(12),
+                reference: String::new(),
+                app: String::new(),
+                captured_at: 1_000,
+                file_path: None,
+                container_tag: "tenant_x".into(),
+            };
+            engine.add_document(&doc).await.unwrap();
+
+            let stmt = "the user prefers Rust for backend work".to_string();
+            let one = std::slice::from_ref(&stmt);
+            let prov = engine.memory_provenance("tenant_x", one).await;
+            assert_eq!(prov.len(), 1);
+            assert_eq!(prov[0].kind.as_deref(), Some("preference"));
+            assert_eq!(prov[0].confidence, Some(0.9));
+            assert_eq!(prov[0].evidence.len(), 1);
+            assert!(prov[0].evidence[0].quote.contains("Engineering notes for the week"));
+            // Wrong tenant → no provenance (isolation).
+            assert!(engine.memory_provenance("other", one).await.is_empty());
+            // No Db attached → empty.
+            let bare = MemoryEngine::new(EngineCfg::default())
+                .with_store(Arc::new(MemStore::new()))
+                .with_embedder(Arc::new(MockEmbedder { dim: 8 }));
+            assert!(bare.memory_provenance("tenant_x", one).await.is_empty());
         });
     }
 
