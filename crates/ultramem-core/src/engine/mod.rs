@@ -1396,6 +1396,52 @@ impl MemoryEngine {
             .collect()
     }
 
+    /// Whether a relational source of truth is attached (jobs/provenance require it).
+    pub fn has_db(&self) -> bool {
+        self.db.is_some()
+    }
+
+    /// Create a tracked background job (state `queued`); returns its id, or `None`
+    /// when no Db is attached (the caller falls back to an untracked task).
+    pub async fn job_create(&self, tag: &str, kind: &str, total: i32) -> Option<String> {
+        let db = self.db.as_ref()?;
+        let now = chrono::Utc::now().timestamp();
+        let job = crate::db::JobRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            container_tag: Some(tag.to_string()),
+            kind: kind.to_string(),
+            state: "queued".into(),
+            progress: 0,
+            total: Some(total),
+            error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        match db.insert_job(&job).await {
+            Ok(()) => Some(job.id),
+            Err(e) => {
+                eprintln!("[ultramem] job_create failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Update a job's state/progress/error (no-op without a Db).
+    pub async fn job_update(&self, id: &str, state: &str, progress: i32, error: Option<&str>) {
+        if let Some(db) = &self.db {
+            let now = chrono::Utc::now().timestamp();
+            if let Err(e) = db.update_job(id, state, progress, error, now).await {
+                eprintln!("[ultramem] job_update failed: {e}");
+            }
+        }
+    }
+
+    /// Fetch a job's status, scoped to its namespace.
+    pub async fn job_get(&self, id: &str, tag: &str) -> Option<crate::db::JobRow> {
+        let db = self.db.as_ref()?;
+        db.get_job(id, tag).await.ok().flatten()
+    }
+
     /// Expose the search plan so callers can route enumeration ("list all
     /// files from last week") to the structured timeline instead of semantic
     /// search, which only ever returns a similarity top-K.
@@ -2829,6 +2875,46 @@ mod tests {
                 .with_store(Arc::new(MemStore::new()))
                 .with_embedder(Arc::new(MockEmbedder { dim: 8 }));
             assert!(bare.memory_provenance("tenant_x", one).await.is_empty());
+        });
+    }
+
+    /// Phase A Task 6: a reindex job is tracked (queued → running → done) and
+    /// queryable, scoped to its namespace. No Db → no job. Offline.
+    #[test]
+    fn job_lifecycle_is_tracked_and_scoped() {
+        use crate::db::mock::MockDb;
+        use crate::providers::mock::MemStore;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let engine = MemoryEngine::new(EngineCfg::default())
+                .with_store(Arc::new(MemStore::new()))
+                .with_db(Arc::new(MockDb::new()));
+            assert!(engine.has_db());
+            let id = engine
+                .job_create("t", "reindex_facts", 5)
+                .await
+                .expect("job id");
+            let j = engine.job_get(&id, "t").await.unwrap();
+            assert_eq!(j.state, "queued");
+            assert_eq!(j.total, Some(5));
+
+            engine.job_update(&id, "running", 3, None).await;
+            let j = engine.job_get(&id, "t").await.unwrap();
+            assert_eq!(j.state, "running");
+            assert_eq!(j.progress, 3);
+
+            engine.job_update(&id, "done", 5, None).await;
+            assert_eq!(engine.job_get(&id, "t").await.unwrap().state, "done");
+
+            // Tag isolation + unknown id.
+            assert!(engine.job_get(&id, "other").await.is_none());
+            assert!(engine.job_get("nope", "t").await.is_none());
+
+            // No Db → no job tracking.
+            let bare =
+                MemoryEngine::new(EngineCfg::default()).with_store(Arc::new(MemStore::new()));
+            assert!(!bare.has_db());
+            assert!(bare.job_create("t", "k", 1).await.is_none());
         });
     }
 

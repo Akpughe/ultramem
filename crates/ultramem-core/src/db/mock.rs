@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::{ChunkRow, Db, DocumentRow, EvidenceRow, MemoryRow};
+use super::{ChunkRow, Db, DocumentRow, EvidenceRow, JobRow, MemoryRow};
 
 #[derive(Default)]
 pub struct MockDb {
@@ -13,6 +13,7 @@ pub struct MockDb {
     chunks: Mutex<HashMap<String, ChunkRow>>,
     memories: Mutex<HashMap<String, MemoryRow>>,
     evidence: Mutex<Vec<EvidenceRow>>,
+    jobs: Mutex<HashMap<String, JobRow>>,
 }
 
 impl MockDb {
@@ -164,6 +165,39 @@ impl Db for MockDb {
             .filter(|e| memory_ids.contains(&e.memory_id))
             .cloned()
             .collect())
+    }
+    async fn insert_job(&self, job: &JobRow) -> Result<(), String> {
+        self.jobs
+            .lock()
+            .unwrap()
+            .entry(job.id.clone())
+            .or_insert_with(|| job.clone());
+        Ok(())
+    }
+    async fn update_job(
+        &self,
+        id: &str,
+        state: &str,
+        progress: i32,
+        error: Option<&str>,
+        updated_at: i64,
+    ) -> Result<(), String> {
+        if let Some(j) = self.jobs.lock().unwrap().get_mut(id) {
+            j.state = state.to_string();
+            j.progress = progress;
+            j.error = error.map(String::from);
+            j.updated_at = updated_at;
+        }
+        Ok(())
+    }
+    async fn get_job(&self, id: &str, container_tag: &str) -> Result<Option<JobRow>, String> {
+        Ok(self
+            .jobs
+            .lock()
+            .unwrap()
+            .get(id)
+            .filter(|j| j.container_tag.as_deref() == Some(container_tag))
+            .cloned())
     }
 }
 

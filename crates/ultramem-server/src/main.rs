@@ -100,6 +100,7 @@ async fn main() {
         .route("/v1/profile", get(profile))
         .route("/v1/timeline", get(timeline))
         .route("/v1/reindex", post(reindex))
+        .route("/v1/jobs/:id", get(job_status))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
 
     let app = Router::new()
@@ -499,9 +500,22 @@ async fn reindex(
                 let total = rows.len();
                 let st = state.clone();
                 let tag = tag.clone();
+                // Track the background work as a job when a Db is attached, so it
+                // is observable via GET /v1/jobs/:id instead of a fire-and-forget
+                // spawn. Falls back to the untracked task when no Db.
+                let job_id = state
+                    .engine
+                    .job_create(&tag, "reindex_facts", total as i32)
+                    .await;
+                let spawn_job = job_id.clone();
                 tokio::spawn(async move {
+                    if let Some(id) = &spawn_job {
+                        st.engine.job_update(id, "running", 0, None).await;
+                    }
+                    let mut done = 0i32;
+                    let mut failed = 0i32;
                     for (doc_id, title, source, reference, captured_at) in rows {
-                        let _ = st
+                        if let Err(e) = st
                             .engine
                             .reindex_doc_facts(
                                 &doc_id,
@@ -511,11 +525,26 @@ async fn reindex(
                                 captured_at,
                                 &tag,
                             )
-                            .await;
+                            .await
+                        {
+                            failed += 1;
+                            eprintln!("[ultramem] reindex_doc_facts failed for {doc_id}: {e}");
+                        }
+                        done += 1;
+                        if let Some(id) = &spawn_job {
+                            st.engine.job_update(id, "running", done, None).await;
+                        }
+                    }
+                    if let Some(id) = &spawn_job {
+                        let err = (failed > 0).then(|| format!("{failed} document(s) failed"));
+                        st.engine.job_update(id, "done", done, err.as_deref()).await;
                     }
                 });
-                Json(json!({ "ok": true, "mode": "facts", "total": total, "status": "running" }))
-                    .into_response()
+                Json(json!({
+                    "ok": true, "mode": "facts", "total": total, "status": "running",
+                    "job_id": job_id,
+                }))
+                .into_response()
             }
             Err(e) => err(e),
         },
@@ -524,6 +553,25 @@ async fn reindex(
             Json(json!({ "error": format!("unknown mode '{other}'") })),
         )
             .into_response(),
+    }
+}
+
+/// `GET /v1/jobs/:id?container_tag=…` — status of a tracked background job.
+/// `404` if the job isn't in the caller's namespace (or job tracking is off,
+/// i.e. no Postgres configured).
+async fn job_status(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Query(q): Query<TagQuery>,
+    Path(id): Path<String>,
+) -> Response {
+    let tag = match resolve_tag(&ctx, &q.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
+    match state.engine.job_get(&id, &tag).await {
+        Some(job) => Json(job).into_response(),
+        None => not_found(),
     }
 }
 

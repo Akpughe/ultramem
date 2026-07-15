@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use super::{ChunkRow, Db, DocumentRow, EvidenceRow, MemoryRow};
+use super::{ChunkRow, Db, DocumentRow, EvidenceRow, JobRow, MemoryRow};
 
 /// Migrations embedded at compile time from `crates/ultramem-core/migrations/`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -296,6 +296,71 @@ impl Db for PgDb {
                 extractor: r.get("extractor"),
             })
             .collect())
+    }
+
+    async fn insert_job(&self, j: &JobRow) -> Result<(), String> {
+        sqlx::query(
+            "insert into jobs (id, container_tag, kind, state, progress, total, error, created_at, updated_at) \
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict (id) do nothing",
+        )
+        .bind(&j.id)
+        .bind(&j.container_tag)
+        .bind(&j.kind)
+        .bind(&j.state)
+        .bind(j.progress)
+        .bind(j.total)
+        .bind(&j.error)
+        .bind(j.created_at)
+        .bind(j.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("insert_job failed: {e}"))?;
+        Ok(())
+    }
+
+    async fn update_job(
+        &self,
+        id: &str,
+        state: &str,
+        progress: i32,
+        error: Option<&str>,
+        updated_at: i64,
+    ) -> Result<(), String> {
+        sqlx::query(
+            "update jobs set state = $2, progress = $3, error = $4, updated_at = $5 where id = $1",
+        )
+        .bind(id)
+        .bind(state)
+        .bind(progress)
+        .bind(error)
+        .bind(updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("update_job failed: {e}"))?;
+        Ok(())
+    }
+
+    async fn get_job(&self, id: &str, container_tag: &str) -> Result<Option<JobRow>, String> {
+        let row = sqlx::query(
+            "select id, container_tag, kind, state, progress, total, error, created_at, updated_at \
+             from jobs where id = $1 and container_tag = $2",
+        )
+        .bind(id)
+        .bind(container_tag)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_job failed: {e}"))?;
+        Ok(row.map(|r| JobRow {
+            id: r.get("id"),
+            container_tag: r.get("container_tag"),
+            kind: r.get("kind"),
+            state: r.get("state"),
+            progress: r.get("progress"),
+            total: r.get("total"),
+            error: r.get("error"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        }))
     }
 }
 
