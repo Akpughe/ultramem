@@ -265,7 +265,10 @@ async fn ingest_json(state: &Arc<AppState>, ctx: &TenantCtx, b: AddBody) -> Resp
     // URL ingestion: fetch + clean via Jina Reader, then the normal pipeline.
     if let Some(url) = b.url.filter(|u| !u.is_empty()) {
         return match state.engine.add_url(&url, b.title, &tag, captured_at).await {
-            Ok(id) => doc_done(id),
+            Ok(id) => {
+                state.engine.audit(&tag, "ingest", Some(&id)).await;
+                doc_done(id)
+            }
             Err(e) => err(e),
         };
     }
@@ -281,7 +284,13 @@ async fn ingest_json(state: &Arc<AppState>, ctx: &TenantCtx, b: AddBody) -> Resp
         container_tag: tag,
     };
     match state.engine.add_document(&doc).await {
-        Ok(id) => doc_done(id),
+        Ok(id) => {
+            state
+                .engine
+                .audit(&doc.container_tag, "ingest", Some(&id))
+                .await;
+            doc_done(id)
+        }
         Err(e) => err(e),
     }
 }
@@ -356,7 +365,13 @@ async fn ingest_multipart(state: &Arc<AppState>, ctx: &TenantCtx, mut mp: Multip
     let result = state.engine.add_document(&doc).await;
     let _ = tokio::fs::remove_file(&tmp).await; // best-effort cleanup
     match result {
-        Ok(id) => doc_done(id),
+        Ok(id) => {
+            state
+                .engine
+                .audit(&doc.container_tag, "ingest", Some(&id))
+                .await;
+            doc_done(id)
+        }
         Err(e) => err(e),
     }
 }
@@ -375,7 +390,10 @@ async fn delete_memory(
         Err(()) => return forbidden(),
     };
     match state.engine.delete_document_tagged(&id, &tag).await {
-        Ok(true) => Json(json!({ "ok": true })).into_response(),
+        Ok(true) => {
+            state.engine.audit(&tag, "delete", Some(&id)).await;
+            Json(json!({ "ok": true })).into_response()
+        }
         Ok(false) => not_found(),
         Err(e) => err(e),
     }
@@ -483,6 +501,7 @@ async fn reindex(
         Ok(t) => t,
         Err(()) => return forbidden(),
     };
+    state.engine.audit(&tag, "reindex", None).await;
     match b.mode.as_deref().unwrap_or("latest") {
         "tags" => match state.engine.claim_legacy_into_tag(&tag).await {
             Ok(()) => {

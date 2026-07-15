@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use super::{ChunkRow, Db, DocumentRow, EvidenceRow, JobRow, MemoryRow};
+use super::{AuditEvent, ChunkRow, Db, DocumentRow, EvidenceRow, JobRow, MemoryRow};
 
 /// Migrations embedded at compile time from `crates/ultramem-core/migrations/`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -361,6 +361,32 @@ impl Db for PgDb {
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
         }))
+    }
+
+    async fn insert_audit(&self, e: &AuditEvent) -> Result<(), String> {
+        sqlx::query(
+            "insert into audit_events (actor, container_tag, action, target_id, request_id, ts) \
+             values ($1,$2,$3,$4,$5,$6)",
+        )
+        .bind(&e.actor)
+        .bind(&e.container_tag)
+        .bind(&e.action)
+        .bind(&e.target_id)
+        .bind(&e.request_id)
+        .bind(e.ts)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| format!("insert_audit failed: {err}"))?;
+        Ok(())
+    }
+
+    async fn audit_count(&self, container_tag: &str) -> Result<i64, String> {
+        let row = sqlx::query("select count(*) as n from audit_events where container_tag = $1")
+            .bind(container_tag)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| format!("audit_count failed: {e}"))?;
+        Ok(row.get::<i64, _>("n"))
     }
 }
 

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::{ChunkRow, Db, DocumentRow, EvidenceRow, JobRow, MemoryRow};
+use super::{AuditEvent, ChunkRow, Db, DocumentRow, EvidenceRow, JobRow, MemoryRow};
 
 #[derive(Default)]
 pub struct MockDb {
@@ -14,6 +14,7 @@ pub struct MockDb {
     memories: Mutex<HashMap<String, MemoryRow>>,
     evidence: Mutex<Vec<EvidenceRow>>,
     jobs: Mutex<HashMap<String, JobRow>>,
+    audits: Mutex<Vec<AuditEvent>>,
 }
 
 impl MockDb {
@@ -198,6 +199,19 @@ impl Db for MockDb {
             .get(id)
             .filter(|j| j.container_tag.as_deref() == Some(container_tag))
             .cloned())
+    }
+    async fn insert_audit(&self, event: &AuditEvent) -> Result<(), String> {
+        self.audits.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+    async fn audit_count(&self, container_tag: &str) -> Result<i64, String> {
+        Ok(self
+            .audits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.container_tag.as_deref() == Some(container_tag))
+            .count() as i64)
     }
 }
 
