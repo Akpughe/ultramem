@@ -83,6 +83,22 @@ pub struct EvidenceRow {
     pub extractor: String,
 }
 
+/// A background job (e.g. a facts reindex) — retires the untracked detached
+/// `tokio::spawn` with a queryable row.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobRow {
+    pub id: String,
+    pub container_tag: Option<String>,
+    pub kind: String,
+    pub state: String, // queued | running | done | failed
+    pub progress: i32,
+    pub total: Option<i32>,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// The relational source of truth. Connection state lives in the impl; the engine
 /// holds an `Option<Arc<dyn Db>>` and uses it only when configured.
 #[async_trait]
@@ -135,4 +151,17 @@ pub trait Db: Send + Sync {
     ) -> Result<Vec<MemoryRow>, String>;
     /// Fetch the evidence rows for the given memory ids.
     async fn evidence_for(&self, memory_ids: &[String]) -> Result<Vec<EvidenceRow>, String>;
+    /// Create a job row (state `queued`).
+    async fn insert_job(&self, job: &JobRow) -> Result<(), String>;
+    /// Update a job's state/progress/error (and bump `updated_at`).
+    async fn update_job(
+        &self,
+        id: &str,
+        state: &str,
+        progress: i32,
+        error: Option<&str>,
+        updated_at: i64,
+    ) -> Result<(), String>;
+    /// Fetch a job by id, scoped to its namespace (`None` if absent/other-tenant).
+    async fn get_job(&self, id: &str, container_tag: &str) -> Result<Option<JobRow>, String>;
 }

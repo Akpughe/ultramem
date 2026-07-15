@@ -107,9 +107,13 @@ Complete newest-first list (not similarity top-K) for "what did I do this week".
 ```
 → `{ "ok": true, "mode": "…" }`, or for `mode=facts` `{ "ok": true, "mode": "facts", "total": N, "status": "running" }`. Reuses stored chunk text. Maps to `claim_legacy_into_tag` / `backfill_facts_latest` / `reindex_doc_facts`.
 
-> **Planned, not implemented:** a persisted job record and progress endpoints
-> (`GET /v1/jobs/:id`, SSE `GET /v1/jobs/:id/stream`). Today `mode=facts` runs as a
-> detached background task with no status/cancellation surface.
+When a Db is configured, `mode=facts` returns a `job_id`; poll it at
+`GET /v1/jobs/:id?container_tag=…` → `{ id, state: "queued|running|done|failed",
+progress, total, error, … }`. Without Postgres, `mode=facts` still runs as a detached
+task and `job_id` is `null`.
+
+> **Planned, not implemented:** an SSE progress stream (`GET /v1/jobs/:id/stream`) and
+> job cancellation.
 
 ### `DELETE /v1/memories/:document_id?container_tag=…` — forget
 Removes the document's chunks + facts **within the caller's namespace only**. A document in
