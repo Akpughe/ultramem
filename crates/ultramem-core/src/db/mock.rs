@@ -139,6 +139,32 @@ impl Db for MockDb {
         self.evidence.lock().unwrap().extend_from_slice(rows);
         Ok(())
     }
+    async fn memories_by_statement(
+        &self,
+        container_tag: &str,
+        statements: &[String],
+    ) -> Result<Vec<MemoryRow>, String> {
+        Ok(self
+            .memories
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|m| {
+                m.container_tag == container_tag && m.is_latest && statements.contains(&m.statement)
+            })
+            .cloned()
+            .collect())
+    }
+    async fn evidence_for(&self, memory_ids: &[String]) -> Result<Vec<EvidenceRow>, String> {
+        Ok(self
+            .evidence
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| memory_ids.contains(&e.memory_id))
+            .cloned()
+            .collect())
+    }
 }
 
 #[cfg(test)]

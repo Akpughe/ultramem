@@ -20,7 +20,10 @@ pub mod llm;
 pub mod providers;
 
 // Public surface — what `ultramem-server` and embedded consumers use.
-pub use engine::{EngineCfg, IngestDoc, MemoryEngine, SearchChunk, SearchResult, DEFAULT_TAG};
+pub use engine::{
+    EngineCfg, EvidenceItem, IngestDoc, MemoryEngine, MemoryProvenance, SearchChunk, SearchResult,
+    DEFAULT_TAG,
+};
 pub use llm::{LlmClient, ResolvedModel};
 pub use providers::{
     EmbedTask, Embedder, JinaEmbedder, JinaReranker, Llm, MistralOcr, Ocr, OpenAiEmbedder,

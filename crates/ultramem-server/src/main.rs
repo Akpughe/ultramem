@@ -404,7 +404,12 @@ async fn search(
         .await
     {
         Ok((docs, memories)) => {
-            Json(json!({ "documents": docs, "memories": memories })).into_response()
+            // Phase A Task 5: attach provenance (kind/confidence/evidence) from
+            // the relational source of truth. `memories` stays a string array
+            // (unchanged); `provenance` is additive and empty without a Db.
+            let provenance = state.engine.memory_provenance(&tag, &memories).await;
+            Json(json!({ "documents": docs, "memories": memories, "provenance": provenance }))
+                .into_response()
         }
         Err(e) => err(e),
     }

@@ -126,4 +126,13 @@ pub trait Db: Send + Sync {
     async fn mark_superseded(&self, pairs: &[(String, String)]) -> Result<(), String>;
     /// Insert memory-evidence rows (idempotent by id).
     async fn insert_evidence(&self, rows: &[EvidenceRow]) -> Result<(), String>;
+    /// Fetch the current (is_latest) memory rows in `container_tag` whose
+    /// `statement` is one of `statements` — the provenance join for retrieval.
+    async fn memories_by_statement(
+        &self,
+        container_tag: &str,
+        statements: &[String],
+    ) -> Result<Vec<MemoryRow>, String>;
+    /// Fetch the evidence rows for the given memory ids.
+    async fn evidence_for(&self, memory_ids: &[String]) -> Result<Vec<EvidenceRow>, String>;
 }
