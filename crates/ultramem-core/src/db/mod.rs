@@ -179,4 +179,13 @@ pub trait Db: Send + Sync {
     async fn insert_audit(&self, event: &AuditEvent) -> Result<(), String>;
     /// Count audit events for a namespace (for tests/inspection).
     async fn audit_count(&self, container_tag: &str) -> Result<i64, String>;
+    /// All chunk rows for a document (ordered by `chunk_index`) — for rebuilding
+    /// the vector index from the source of truth.
+    async fn chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRow>, String>;
+    /// All memory rows in a namespace (for rebuilding the facts index).
+    async fn memories_for_tag(
+        &self,
+        container_tag: &str,
+        cap: i64,
+    ) -> Result<Vec<MemoryRow>, String>;
 }
