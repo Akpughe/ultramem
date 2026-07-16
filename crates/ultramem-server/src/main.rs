@@ -118,6 +118,9 @@ async fn main() {
         .route("/v1/memories/:id/promote", post(promote_memory))
         .route("/v1/facts/:id", axum::routing::delete(forget_fact))
         .route("/v1/memories/as_of", get(memories_as_of))
+        .route("/v1/entities/alias", post(add_alias))
+        .route("/v1/entities/aliases", get(list_aliases))
+        .route("/v1/entities/resolve", get(resolve_entity))
         .route("/v1/search", post(search))
         .route("/v1/profile", get(profile))
         .route("/v1/timeline", get(timeline))
@@ -647,6 +650,78 @@ async fn job_status(
         Some(job) => Json(job).into_response(),
         None => not_found(),
     }
+}
+
+// ── entity resolution / aliases (9/10 quality, slice 9b) ─────────────────────
+#[derive(Deserialize)]
+struct AliasBody {
+    alias: String,
+    canonical: String,
+    container_tag: Option<String>,
+}
+
+/// `POST /v1/entities/alias` — register a surface form → canonical entity mapping,
+/// scoped to the caller's namespace.
+async fn add_alias(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Json(b): Json<AliasBody>,
+) -> Response {
+    let tag = match resolve_tag(&ctx, &b.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
+    match state.engine.alias_add(&tag, &b.alias, &b.canonical).await {
+        Ok(()) => {
+            state
+                .engine
+                .audit(&tag, "alias_add", Some(&b.canonical))
+                .await;
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(e) => err(e),
+    }
+}
+
+/// `GET /v1/entities/aliases?container_tag=…` — list a namespace's aliases.
+async fn list_aliases(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Query(q): Query<TagQuery>,
+) -> Response {
+    let tag = match resolve_tag(&ctx, &q.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
+    let items: Vec<Value> = state
+        .engine
+        .aliases_for_tag(&tag)
+        .await
+        .into_iter()
+        .map(|a| json!({ "alias": a.alias, "canonical": a.canonical, "created_at": a.created_at }))
+        .collect();
+    Json(json!({ "aliases": items })).into_response()
+}
+
+#[derive(Deserialize)]
+struct ResolveQuery {
+    name: String,
+    container_tag: Option<String>,
+}
+
+/// `GET /v1/entities/resolve?name=…&container_tag=…` — resolve a name to its
+/// canonical entity (identity if unregistered).
+async fn resolve_entity(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Query(q): Query<ResolveQuery>,
+) -> Response {
+    let tag = match resolve_tag(&ctx, &q.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
+    let canonical = state.engine.resolve_entity(&tag, &q.name).await;
+    Json(json!({ "name": q.name, "canonical": canonical })).into_response()
 }
 
 // ── bitemporal as-of (9/10 temporal, slice 9a) ───────────────────────────────

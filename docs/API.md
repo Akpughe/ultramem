@@ -101,6 +101,16 @@ Maps to `MemoryEngine::retrieve_tagged` (planner + multi-query + rerank + `is_la
 ### `GET /v1/timeline?container_tag=…&source=…&before=…&limit=60` — enumeration
 Complete newest-first list (not similarity top-K) for "what did I do this week". Backed by the new `list_document_ids` scroll (see EXTRACTION §3).
 
+### Entity resolution — canonical entities (requires Postgres)
+Unify surface forms of an entity within a namespace. Resolution is **explicit**: only
+registered aliases unify, and an unknown name resolves to itself (never an invented merge).
+Aliases are stored normalized (case/whitespace-folded), so lookups are variant-insensitive.
+
+- `POST /v1/entities/alias` `{ "alias": "J. Smith", "canonical": "Jane A. Smith" }`
+  → `{ "ok": true }`. Re-registering an alias updates its canonical.
+- `GET /v1/entities/resolve?name=j.%20smith` → `{ "name": "j. smith", "canonical": "Jane A. Smith" }`.
+- `GET /v1/entities/aliases?container_tag=…` → `{ "aliases": [ { alias, canonical, created_at } ] }`.
+
 ### `GET /v1/memories/as_of?t=…&container_tag=…&limit=200` — point-in-time recall (requires Postgres)
 Bitemporal read: returns the memories that were **current knowledge as of transaction
 time `t`** (unix seconds) — learned by then, not yet superseded as of `t`, still valid in

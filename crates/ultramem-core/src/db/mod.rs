@@ -114,6 +114,17 @@ pub struct AclEntry {
     pub created_at: i64,
 }
 
+/// An entity alias: within `container_tag`, the normalized surface form `alias`
+/// refers to the canonical entity `canonical` (9/10 entity resolution). Explicit —
+/// nothing is merged implicitly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasEntry {
+    pub container_tag: String,
+    pub alias: String,
+    pub canonical: String,
+    pub created_at: i64,
+}
+
 /// A forensic audit record of a mutating operation (id is DB-generated).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEvent {
@@ -222,6 +233,11 @@ pub trait Db: Send + Sync {
     /// Returns whether a row was actually removed (`false` if absent or in another
     /// tenant) — the ownership gate for fact-granular forget / right-to-erasure.
     async fn delete_memory(&self, id: &str, container_tag: &str) -> Result<bool, String>;
+    /// Register (or update) an entity alias in a namespace. Keyed by
+    /// `(container_tag, alias)` — re-registering an alias updates its canonical.
+    async fn add_alias(&self, entry: &AliasEntry) -> Result<(), String>;
+    /// All entity aliases in a namespace (for resolution + the admin listing).
+    async fn aliases_for_tag(&self, container_tag: &str) -> Result<Vec<AliasEntry>, String>;
     /// Grant a principal a capability on a scope (idempotent).
     async fn grant_acl(&self, entry: &AclEntry) -> Result<(), String>;
     /// Revoke a specific grant (idempotent — an absent grant is a no-op).

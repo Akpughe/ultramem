@@ -18,6 +18,15 @@ entry records what changed, what was verified, and what the next sprint is.
   since-superseded fact surfaces for a time before its correction and disappears
   after, an expiring fact drops at `valid_until`, and quarantined/other-tenant rows
   never appear. Documented in `docs/API.md`.
+- **9b — entity resolution / aliases** (branch `temporal-9b-entities`) — a
+  per-namespace canonical-entity registry so explicit surface forms ("J. Smith" →
+  "Jane A. Smith") unify. New pure `entity` module (`normalize` + `resolve`, fully
+  tested), `entity_aliases` table (migration `0004`), `Db::add_alias`/
+  `aliases_for_tag` (PG upsert-on-conflict + Mock), engine `alias_add`/
+  `resolve_entity`/`aliases_for_tag`, and `/v1/entities/alias|resolve|aliases`.
+  Fail-open-on-identity: only registered aliases unify; an unknown name resolves to
+  itself (never an invented merge); scoped per namespace; re-registering updates.
+  Additive/inert — retrieval-time expansion is a later slice. Documented in `docs/API.md`.
 
 ---
 

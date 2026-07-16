@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use super::{AclEntry, AuditEvent, ChunkRow, Db, DocumentRow, EvidenceRow, JobRow, MemoryRow};
+use super::{
+    AclEntry, AliasEntry, AuditEvent, ChunkRow, Db, DocumentRow, EvidenceRow, JobRow, MemoryRow,
+};
 
 /// Migrations embedded at compile time from `crates/ultramem-core/migrations/`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -416,6 +418,43 @@ impl Db for PgDb {
                 content: r.get("content"),
                 embed_model: r.get("embed_model"),
                 dim: r.get("dim"),
+            })
+            .collect())
+    }
+
+    async fn add_alias(&self, e: &AliasEntry) -> Result<(), String> {
+        sqlx::query(
+            "insert into entity_aliases (container_tag, alias, canonical, created_at) \
+             values ($1,$2,$3,$4) \
+             on conflict (container_tag, alias) \
+             do update set canonical = excluded.canonical, created_at = excluded.created_at",
+        )
+        .bind(&e.container_tag)
+        .bind(&e.alias)
+        .bind(&e.canonical)
+        .bind(e.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| format!("add_alias failed: {err}"))?;
+        Ok(())
+    }
+
+    async fn aliases_for_tag(&self, container_tag: &str) -> Result<Vec<AliasEntry>, String> {
+        let rows = sqlx::query(
+            "select container_tag, alias, canonical, created_at \
+             from entity_aliases where container_tag = $1",
+        )
+        .bind(container_tag)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("aliases_for_tag failed: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AliasEntry {
+                container_tag: r.get("container_tag"),
+                alias: r.get("alias"),
+                canonical: r.get("canonical"),
+                created_at: r.get("created_at"),
             })
             .collect())
     }
