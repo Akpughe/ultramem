@@ -16,6 +16,7 @@
 
 pub mod db;
 pub mod engine;
+pub mod entity;
 pub mod llm;
 pub mod providers;
 pub mod scope;

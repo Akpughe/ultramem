@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::{AclEntry, AuditEvent, ChunkRow, Db, DocumentRow, EvidenceRow, JobRow, MemoryRow};
+use super::{
+    AclEntry, AliasEntry, AuditEvent, ChunkRow, Db, DocumentRow, EvidenceRow, JobRow, MemoryRow,
+};
 
 #[derive(Default)]
 pub struct MockDb {
@@ -16,6 +18,7 @@ pub struct MockDb {
     jobs: Mutex<HashMap<String, JobRow>>,
     audits: Mutex<Vec<AuditEvent>>,
     acls: Mutex<Vec<AclEntry>>,
+    aliases: Mutex<Vec<AliasEntry>>,
 }
 
 impl MockDb {
@@ -287,6 +290,30 @@ impl Db for MockDb {
         memories.remove(id);
         self.evidence.lock().unwrap().retain(|e| e.memory_id != id);
         Ok(true)
+    }
+    async fn add_alias(&self, entry: &AliasEntry) -> Result<(), String> {
+        let mut aliases = self.aliases.lock().unwrap();
+        // Keyed by (container_tag, alias): re-registering updates the canonical.
+        if let Some(existing) = aliases
+            .iter_mut()
+            .find(|a| a.container_tag == entry.container_tag && a.alias == entry.alias)
+        {
+            existing.canonical = entry.canonical.clone();
+            existing.created_at = entry.created_at;
+        } else {
+            aliases.push(entry.clone());
+        }
+        Ok(())
+    }
+    async fn aliases_for_tag(&self, container_tag: &str) -> Result<Vec<AliasEntry>, String> {
+        Ok(self
+            .aliases
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.container_tag == container_tag)
+            .cloned()
+            .collect())
     }
     async fn grant_acl(&self, entry: &AclEntry) -> Result<(), String> {
         let mut acls = self.acls.lock().unwrap();

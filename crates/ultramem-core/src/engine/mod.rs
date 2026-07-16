@@ -1644,6 +1644,49 @@ impl MemoryEngine {
         db.memories_as_of(tag, t, limit).await.unwrap_or_default()
     }
 
+    /// Register (or update) an entity alias in a namespace: the surface form
+    /// `alias` (stored normalized) refers to `canonical`. Requires a relational
+    /// store; rejects an empty alias/canonical.
+    pub async fn alias_add(&self, tag: &str, alias: &str, canonical: &str) -> Result<(), String> {
+        let alias = crate::entity::normalize(alias);
+        if alias.is_empty() {
+            return Err("alias is empty after normalization".into());
+        }
+        let canonical = canonical.trim();
+        if canonical.is_empty() {
+            return Err("canonical is empty".into());
+        }
+        let Some(db) = &self.db else {
+            return Err("entity aliases require a relational store (set ULTRAMEM_PG_URL)".into());
+        };
+        db.add_alias(&crate::db::AliasEntry {
+            container_tag: tag.to_string(),
+            alias,
+            canonical: canonical.to_string(),
+            created_at: chrono::Utc::now().timestamp(),
+        })
+        .await
+    }
+
+    /// Resolve a name to its canonical entity within a namespace — identity if the
+    /// name is unregistered or no relational store is attached (never invents a
+    /// merge). See [`crate::entity::resolve`].
+    pub async fn resolve_entity(&self, tag: &str, name: &str) -> String {
+        let Some(db) = &self.db else {
+            return name.trim().to_string();
+        };
+        let aliases = db.aliases_for_tag(tag).await.unwrap_or_default();
+        crate::entity::resolve(name, &aliases)
+    }
+
+    /// All entity aliases in a namespace (admin listing). Empty without a Db.
+    pub async fn aliases_for_tag(&self, tag: &str) -> Vec<crate::db::AliasEntry> {
+        let Some(db) = &self.db else {
+            return Vec::new();
+        };
+        db.aliases_for_tag(tag).await.unwrap_or_default()
+    }
+
     /// Whether a relational source of truth is attached (jobs/provenance require it).
     pub fn has_db(&self) -> bool {
         self.db.is_some()
@@ -4269,6 +4312,58 @@ mod pipeline_tests {
             let bare =
                 MemoryEngine::new(EngineCfg::default()).with_store(Arc::new(MemStore::new()));
             assert!(bare.forget_memory("alice", "m1").await.is_err());
+        });
+    }
+
+    /// 9/10 slice 9b — entity resolution. A registered surface form resolves to its
+    /// canonical entity (case/spacing-insensitively), an unregistered name resolves
+    /// to itself, aliases are namespace-scoped, and re-registering updates. Offline.
+    #[test]
+    fn entity_aliases_resolve_scoped_and_updatable() {
+        use crate::db::mock::MockDb;
+        use crate::providers::mock::MemStore;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = Arc::new(MockDb::new());
+            let engine = MemoryEngine::new(EngineCfg::default())
+                .with_store(Arc::new(MemStore::new()))
+                .with_db(db.clone());
+
+            engine
+                .alias_add("acme", "J. Smith", "Jane A. Smith")
+                .await
+                .unwrap();
+            // Case/spacing variants of the registered form resolve to canonical.
+            assert_eq!(
+                engine.resolve_entity("acme", "j.  smith").await,
+                "Jane A. Smith"
+            );
+            // Unregistered name → itself (never invents a merge).
+            assert_eq!(
+                engine.resolve_entity("acme", "Bob Jones").await,
+                "Bob Jones"
+            );
+            // Namespace-scoped: another tenant does not see acme's alias.
+            assert_eq!(engine.resolve_entity("other", "J. Smith").await, "J. Smith");
+
+            // Re-registering the same surface form updates the canonical (no dupes).
+            engine
+                .alias_add("acme", "j. smith", "Jane B. Smith")
+                .await
+                .unwrap();
+            assert_eq!(engine.aliases_for_tag("acme").await.len(), 1);
+            assert_eq!(
+                engine.resolve_entity("acme", "J. Smith").await,
+                "Jane B. Smith"
+            );
+
+            // Empty alias/canonical are rejected; no Db → identity + unavailable admin.
+            assert!(engine.alias_add("acme", "  ", "X").await.is_err());
+            assert!(engine.alias_add("acme", "y", "  ").await.is_err());
+            let bare =
+                MemoryEngine::new(EngineCfg::default()).with_store(Arc::new(MemStore::new()));
+            assert_eq!(bare.resolve_entity("acme", "J. Smith").await, "J. Smith");
+            assert!(bare.alias_add("acme", "a", "b").await.is_err());
         });
     }
 }
