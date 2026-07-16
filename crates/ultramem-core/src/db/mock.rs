@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::{AuditEvent, ChunkRow, Db, DocumentRow, EvidenceRow, JobRow, MemoryRow};
+use super::{AclEntry, AuditEvent, ChunkRow, Db, DocumentRow, EvidenceRow, JobRow, MemoryRow};
 
 #[derive(Default)]
 pub struct MockDb {
@@ -15,6 +15,7 @@ pub struct MockDb {
     evidence: Mutex<Vec<EvidenceRow>>,
     jobs: Mutex<HashMap<String, JobRow>>,
     audits: Mutex<Vec<AuditEvent>>,
+    acls: Mutex<Vec<AclEntry>>,
 }
 
 impl MockDb {
@@ -240,6 +241,27 @@ impl Db for MockDb {
             .cloned()
             .collect())
     }
+    async fn grant_acl(&self, entry: &AclEntry) -> Result<(), String> {
+        let mut acls = self.acls.lock().unwrap();
+        if !acls.iter().any(|a| {
+            a.principal == entry.principal
+                && a.scope == entry.scope
+                && a.capability == entry.capability
+        }) {
+            acls.push(entry.clone());
+        }
+        Ok(())
+    }
+    async fn acls_for_principal(&self, principal: &str) -> Result<Vec<AclEntry>, String> {
+        Ok(self
+            .acls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.principal == principal)
+            .cloned()
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -277,6 +299,26 @@ mod tests {
             // Tag isolation: another namespace can't read it.
             assert!(db.get_document("d1", "other").await.unwrap().is_none());
             assert!(db.get_document("missing", "t").await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn acl_grant_is_idempotent_and_per_principal() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = MockDb::new();
+            let mk = |p: &str, s: &str, c: &str| AclEntry {
+                principal: p.into(),
+                scope: s.into(),
+                capability: c.into(),
+                created_at: 0,
+            };
+            db.grant_acl(&mk("u1", "team", "read")).await.unwrap();
+            db.grant_acl(&mk("u1", "team", "read")).await.unwrap(); // idempotent
+            db.grant_acl(&mk("u2", "team", "read")).await.unwrap();
+            assert_eq!(db.acls_for_principal("u1").await.unwrap().len(), 1);
+            assert_eq!(db.acls_for_principal("u2").await.unwrap().len(), 1);
+            assert!(db.acls_for_principal("nobody").await.unwrap().is_empty());
         });
     }
 

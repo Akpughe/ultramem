@@ -18,6 +18,7 @@ pub mod db;
 pub mod engine;
 pub mod llm;
 pub mod providers;
+pub mod scope;
 
 // Public surface — what `ultramem-server` and embedded consumers use.
 pub use engine::{

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use super::{AuditEvent, ChunkRow, Db, DocumentRow, EvidenceRow, JobRow, MemoryRow};
+use super::{AclEntry, AuditEvent, ChunkRow, Db, DocumentRow, EvidenceRow, JobRow, MemoryRow};
 
 /// Migrations embedded at compile time from `crates/ultramem-core/migrations/`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -410,6 +410,40 @@ impl Db for PgDb {
                 content: r.get("content"),
                 embed_model: r.get("embed_model"),
                 dim: r.get("dim"),
+            })
+            .collect())
+    }
+
+    async fn grant_acl(&self, e: &AclEntry) -> Result<(), String> {
+        sqlx::query(
+            "insert into acl_entries (principal, scope, capability, created_at) \
+             values ($1,$2,$3,$4) on conflict (principal, scope, capability) do nothing",
+        )
+        .bind(&e.principal)
+        .bind(&e.scope)
+        .bind(&e.capability)
+        .bind(e.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| format!("grant_acl failed: {err}"))?;
+        Ok(())
+    }
+
+    async fn acls_for_principal(&self, principal: &str) -> Result<Vec<AclEntry>, String> {
+        let rows = sqlx::query(
+            "select principal, scope, capability, created_at from acl_entries where principal = $1",
+        )
+        .bind(principal)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("acls_for_principal failed: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AclEntry {
+                principal: r.get("principal"),
+                scope: r.get("scope"),
+                capability: r.get("capability"),
+                created_at: r.get("created_at"),
             })
             .collect())
     }

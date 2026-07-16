@@ -101,6 +101,16 @@ pub struct JobRow {
     pub updated_at: i64,
 }
 
+/// An access grant: `principal` has `capability` on `scope` (a container_tag).
+/// The foundation of the multi-scope company brain (8/10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclEntry {
+    pub principal: String,
+    pub scope: String,
+    pub capability: String, // read | write | promote | admin
+    pub created_at: i64,
+}
+
 /// A forensic audit record of a mutating operation (id is DB-generated).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEvent {
@@ -190,4 +200,8 @@ pub trait Db: Send + Sync {
         container_tag: &str,
         cap: i64,
     ) -> Result<Vec<MemoryRow>, String>;
+    /// Grant a principal a capability on a scope (idempotent).
+    async fn grant_acl(&self, entry: &AclEntry) -> Result<(), String>;
+    /// All ACL grants held by a principal.
+    async fn acls_for_principal(&self, principal: &str) -> Result<Vec<AclEntry>, String>;
 }
