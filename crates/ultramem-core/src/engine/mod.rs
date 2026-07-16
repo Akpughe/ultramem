@@ -1455,6 +1455,57 @@ impl MemoryEngine {
         crate::scope::visible_scopes(tag, &acls)
     }
 
+    /// Grant `principal` a `capability` on `scope` (idempotent). Requires a
+    /// relational store (ACLs live in Postgres) and a recognized capability;
+    /// authorization of *who may call this* is enforced at the API boundary.
+    pub async fn acl_grant(
+        &self,
+        principal: &str,
+        scope: &str,
+        capability: &str,
+    ) -> Result<(), String> {
+        if !crate::scope::is_valid_capability(capability) {
+            return Err(format!("unknown capability: {capability}"));
+        }
+        let Some(db) = &self.db else {
+            return Err("ACLs require a relational store (set ULTRAMEM_PG_URL)".into());
+        };
+        db.grant_acl(&crate::db::AclEntry {
+            principal: principal.to_string(),
+            scope: scope.to_string(),
+            capability: capability.to_string(),
+            created_at: chrono::Utc::now().timestamp(),
+        })
+        .await
+    }
+
+    /// Revoke a specific grant (idempotent — an absent grant is a no-op).
+    pub async fn acl_revoke(
+        &self,
+        principal: &str,
+        scope: &str,
+        capability: &str,
+    ) -> Result<(), String> {
+        let Some(db) = &self.db else {
+            return Err("ACLs require a relational store (set ULTRAMEM_PG_URL)".into());
+        };
+        db.revoke_acl(&crate::db::AclEntry {
+            principal: principal.to_string(),
+            scope: scope.to_string(),
+            capability: capability.to_string(),
+            created_at: 0,
+        })
+        .await
+    }
+
+    /// The grants ON a scope (who may access it), for the admin listing.
+    pub async fn acls_for_scope(&self, scope: &str) -> Result<Vec<crate::db::AclEntry>, String> {
+        let Some(db) = &self.db else {
+            return Err("ACLs require a relational store (set ULTRAMEM_PG_URL)".into());
+        };
+        db.acls_for_scope(scope).await
+    }
+
     /// Whether a relational source of truth is attached (jobs/provenance require it).
     pub fn has_db(&self) -> bool {
         self.db.is_some()
@@ -3846,6 +3897,50 @@ mod pipeline_tests {
                 bare.visible_scopes_for("alice").await,
                 vec!["alice".to_string()]
             );
+        });
+    }
+
+    /// 8/10 slice 8c — the engine ACL admin surface: grant/revoke/list, an
+    /// unknown capability is rejected, ACLs require a Db, and a grant actually
+    /// widens the visible-scope set that 8b enforces. Offline.
+    #[test]
+    fn acl_admin_roundtrip_and_widens_visibility() {
+        use crate::db::mock::MockDb;
+        use crate::providers::mock::MemStore;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = Arc::new(MockDb::new());
+            let engine = MemoryEngine::new(EngineCfg::default())
+                .with_store(Arc::new(MemStore::new()))
+                .with_db(db.clone());
+
+            // An unknown capability is rejected (fail-closed) and writes nothing.
+            assert!(engine.acl_grant("alice", "team", "sudo").await.is_err());
+            assert!(engine.acls_for_scope("team").await.unwrap().is_empty());
+
+            // Grant read → listed on the scope, and now visible to the principal.
+            engine.acl_grant("alice", "team", "read").await.unwrap();
+            let grants = engine.acls_for_scope("team").await.unwrap();
+            assert_eq!(grants.len(), 1);
+            assert_eq!(grants[0].principal, "alice");
+            assert!(engine
+                .visible_scopes_for("alice")
+                .await
+                .contains(&"team".to_string()));
+
+            // Revoke → gone from the scope, and no longer visible.
+            engine.acl_revoke("alice", "team", "read").await.unwrap();
+            assert!(engine.acls_for_scope("team").await.unwrap().is_empty());
+            assert!(!engine
+                .visible_scopes_for("alice")
+                .await
+                .contains(&"team".to_string()));
+
+            // Without a relational store, ACL admin is unavailable (not a silent ok).
+            let bare =
+                MemoryEngine::new(EngineCfg::default()).with_store(Arc::new(MemStore::new()));
+            assert!(bare.acl_grant("alice", "team", "read").await.is_err());
+            assert!(bare.acls_for_scope("team").await.is_err());
         });
     }
 }

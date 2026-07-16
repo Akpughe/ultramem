@@ -28,15 +28,27 @@ as before — access only ever *expands* via an explicit `grant_acl`.
   the property against the same evaluator reads use: a principal granted `team`
   sees own + `team` but never an ungranted `hr`, and superseded facts stay excluded
   inside a granted scope. `filter_matches` exposed `pub(crate)` for the assertion.
+- **8c — ACL admin endpoints** (branch `scopes-8c-acl-admin`) — makes the 8a/8b
+  machinery *operable*: grants were previously only creatable directly in the DB.
+  Adds `revoke_acl` + `acls_for_scope` to the `Db` trait (PG + Mock), engine
+  wrappers `acl_grant`/`acl_revoke`/`acls_for_scope` (require a Db; reject unknown
+  capabilities via `scope::is_valid_capability`), and three server endpoints
+  (`POST /v1/acl/grant`, `POST /v1/acl/revoke`, `GET /v1/acl?scope=`). Authorization
+  is fail-closed via `can_admin_scope`: you may only administer a scope your
+  credential can already act as — a key bound to `user_a` cannot grant on `user_b`
+  or a company scope it wasn't given. Every grant/revoke is audited. Documented in
+  `docs/API.md`.
 
 ### Verified (this machine)
 `cargo fmt --check`, `clippy --all-targets -D warnings`, `cargo test --workspace
---all-targets` (127 core + 12 server) + `--doc` all green. 3 new 8b tests.
+--all-targets` (129 core + 13 server) + `--doc` all green. 8b/8c added 6 tests
+(scope-filter no-op + leak, resolver, ACL round-trip, revoke/by-scope, admin-authz).
 
 ### Next (remaining 8/10)
-Promotion flow (private→shared via `promote` capability), memory
-review/edit/pin/reject/forget/export endpoints, per-scope profile entries — then
-9/10 (temporal graph on in prod, entity resolution, bitemporal `as_of`).
+Promotion flow (private→shared via the `promote` capability: copy a personal memory
+into a shared scope with a provenance link), memory review/edit/pin/reject/forget
+endpoints, per-scope profile entries — then 9/10 (temporal graph on in prod, entity
+resolution, bitemporal `as_of`).
 
 ---
 

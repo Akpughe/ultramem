@@ -252,6 +252,14 @@ impl Db for MockDb {
         }
         Ok(())
     }
+    async fn revoke_acl(&self, entry: &AclEntry) -> Result<(), String> {
+        self.acls.lock().unwrap().retain(|a| {
+            !(a.principal == entry.principal
+                && a.scope == entry.scope
+                && a.capability == entry.capability)
+        });
+        Ok(())
+    }
     async fn acls_for_principal(&self, principal: &str) -> Result<Vec<AclEntry>, String> {
         Ok(self
             .acls
@@ -259,6 +267,16 @@ impl Db for MockDb {
             .unwrap()
             .iter()
             .filter(|a| a.principal == principal)
+            .cloned()
+            .collect())
+    }
+    async fn acls_for_scope(&self, scope: &str) -> Result<Vec<AclEntry>, String> {
+        Ok(self
+            .acls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.scope == scope)
             .cloned()
             .collect())
     }
@@ -319,6 +337,37 @@ mod tests {
             assert_eq!(db.acls_for_principal("u1").await.unwrap().len(), 1);
             assert_eq!(db.acls_for_principal("u2").await.unwrap().len(), 1);
             assert!(db.acls_for_principal("nobody").await.unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn acl_revoke_and_by_scope() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = MockDb::new();
+            let mk = |p: &str, s: &str, c: &str| AclEntry {
+                principal: p.into(),
+                scope: s.into(),
+                capability: c.into(),
+                created_at: 0,
+            };
+            db.grant_acl(&mk("u1", "team", "read")).await.unwrap();
+            db.grant_acl(&mk("u2", "team", "write")).await.unwrap();
+            db.grant_acl(&mk("u1", "other", "read")).await.unwrap();
+
+            // acls_for_scope returns every grant ON that scope, across principals.
+            let team = db.acls_for_scope("team").await.unwrap();
+            assert_eq!(team.len(), 2);
+            assert!(team.iter().all(|a| a.scope == "team"));
+
+            // Revoke is specific to (principal, scope, capability) and idempotent.
+            db.revoke_acl(&mk("u1", "team", "read")).await.unwrap();
+            db.revoke_acl(&mk("u1", "team", "read")).await.unwrap(); // no-op
+            let team = db.acls_for_scope("team").await.unwrap();
+            assert_eq!(team.len(), 1);
+            assert_eq!(team[0].principal, "u2");
+            // The unrelated grant on another scope is untouched.
+            assert_eq!(db.acls_for_scope("other").await.unwrap().len(), 1);
         });
     }
 

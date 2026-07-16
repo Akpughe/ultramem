@@ -120,6 +120,21 @@ Removes the document's chunks + facts **within the caller's namespace only**. A 
 another tenant's namespace returns `404` (and is not touched). A `container_tag` the
 credential doesn't own returns `403`. Maps to `delete_document_tagged`.
 
+### ACL admin — company-brain scopes (requires Postgres)
+Grants let a principal read another **scope** (a `container_tag`) beyond its own. Search
+then spans the caller's own scope **plus** any it has been granted read (or higher) on —
+fail-closed: with no grants, behavior is identical to single-namespace isolation. You may
+only administer a scope you already control (a credential bound to it, or a wildcard
+backend); administering a scope your credential can't act as returns `403`.
+
+- `POST /v1/acl/grant` `{ "principal": "user_a", "scope": "team_eng", "capability": "read" }`
+  → `{ "ok": true }`. `capability` ∈ `read | write | promote | admin` (higher implies read);
+  an unknown capability is `400`.
+- `POST /v1/acl/revoke` `{ "principal": "user_a", "scope": "team_eng", "capability": "read" }`
+  → `{ "ok": true }` (idempotent).
+- `GET /v1/acl?scope=team_eng` → `{ "grants": [ { principal, scope, capability, created_at } ] }`
+  — who may access the scope.
+
 ### `GET /v1/health`
 → `{ "ok": true }` (no auth). Maps to `MemoryEngine::health` (Qdrant reachability + a
 provider-key presence check).

@@ -120,6 +120,9 @@ async fn main() {
         .route("/v1/timeline", get(timeline))
         .route("/v1/reindex", post(reindex))
         .route("/v1/jobs/:id", get(job_status))
+        .route("/v1/acl/grant", post(acl_grant))
+        .route("/v1/acl/revoke", post(acl_revoke))
+        .route("/v1/acl", get(acl_list))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
 
     let app = Router::new()
@@ -196,6 +199,16 @@ fn not_found() -> Response {
 /// doesn't carry a large `Response`).
 fn resolve_tag(ctx: &TenantCtx, requested: &Option<String>) -> Result<String, ()> {
     ctx.resolve_tag(requested).map_err(|_| ())
+}
+
+/// Whether the caller may administer ACL grants on `scope`. A caller controls a
+/// scope iff it is authorized to act *as* that tag — i.e. `resolve_tag(Some(scope))`
+/// returns `scope`. So the owner of a namespace (a key bound to it, or a trusted
+/// wildcard backend) manages who else may access it, while a key bound to
+/// `user_a` can never administer `user_b` or a company scope it wasn't given.
+/// Fail-closed: anything the credential can't already act as is denied.
+fn can_admin_scope(ctx: &TenantCtx, scope: &str) -> bool {
+    matches!(ctx.resolve_tag(&Some(scope.to_string())), Ok(t) if t == scope)
 }
 
 // ── health ──────────────────────────────────────────────────────────────────
@@ -633,9 +646,111 @@ async fn job_status(
     }
 }
 
+// ── ACL admin (8/10 scopes, slice 8c) ────────────────────────────────────────
+// Populate/inspect the grants that slice 8b enforces at read time. Every handler
+// is gated by `can_admin_scope`: you may only administer a scope you already
+// control. Grants live in Postgres, so these require a relational store.
+#[derive(Deserialize)]
+struct AclBody {
+    principal: String,
+    scope: String,
+    capability: String,
+}
+
+/// `POST /v1/acl/grant` — grant `principal` a capability on `scope`.
+async fn acl_grant(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Json(b): Json<AclBody>,
+) -> Response {
+    if !can_admin_scope(&ctx, &b.scope) {
+        return forbidden();
+    }
+    if !ultramem_core::scope::is_valid_capability(&b.capability) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("unknown capability: {}", b.capability) })),
+        )
+            .into_response();
+    }
+    match state
+        .engine
+        .acl_grant(&b.principal, &b.scope, &b.capability)
+        .await
+    {
+        Ok(()) => {
+            state
+                .engine
+                .audit(&b.scope, "acl_grant", Some(&b.principal))
+                .await;
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(e) => err(e),
+    }
+}
+
+/// `POST /v1/acl/revoke` — remove a specific grant (idempotent).
+async fn acl_revoke(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Json(b): Json<AclBody>,
+) -> Response {
+    if !can_admin_scope(&ctx, &b.scope) {
+        return forbidden();
+    }
+    match state
+        .engine
+        .acl_revoke(&b.principal, &b.scope, &b.capability)
+        .await
+    {
+        Ok(()) => {
+            state
+                .engine
+                .audit(&b.scope, "acl_revoke", Some(&b.principal))
+                .await;
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AclListQuery {
+    scope: String,
+}
+
+/// `GET /v1/acl?scope=…` — list who may access a scope.
+async fn acl_list(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Query(q): Query<AclListQuery>,
+) -> Response {
+    if !can_admin_scope(&ctx, &q.scope) {
+        return forbidden();
+    }
+    match state.engine.acls_for_scope(&q.scope).await {
+        Ok(entries) => {
+            let items: Vec<Value> = entries
+                .into_iter()
+                .map(|a| {
+                    json!({
+                        "principal": a.principal,
+                        "scope": a.scope,
+                        "capability": a.capability,
+                        "created_at": a.created_at,
+                    })
+                })
+                .collect();
+            Json(json!({ "grants": items })).into_response()
+        }
+        Err(e) => err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tenant::TagPolicy;
 
     fn body(file_path: Option<Value>) -> AddBody {
         AddBody {
@@ -671,5 +786,30 @@ mod tests {
     #[test]
     fn json_ingest_allows_normal_content() {
         assert!(check_add_body(&body(None)).is_ok());
+    }
+
+    #[test]
+    fn acl_admin_is_confined_to_controlled_scopes() {
+        // A per-user key bound to `user_a` may administer only `user_a`.
+        let ua = TenantCtx::new(TagPolicy::Only(vec!["user_a".into()]));
+        assert!(can_admin_scope(&ua, "user_a"));
+        assert!(
+            !can_admin_scope(&ua, "user_b"),
+            "ESCALATION: bound key administered another principal's scope"
+        );
+        assert!(
+            !can_admin_scope(&ua, "company"),
+            "ESCALATION: bound key administered a scope it wasn't given"
+        );
+
+        // A key bound to several scopes administers exactly those.
+        let team = TenantCtx::new(TagPolicy::Only(vec!["team_eng".into(), "user_a".into()]));
+        assert!(can_admin_scope(&team, "team_eng"));
+        assert!(can_admin_scope(&team, "user_a"));
+        assert!(!can_admin_scope(&team, "team_sales"));
+
+        // A trusted wildcard backend administers any scope (it manages tenants).
+        let any = TenantCtx::any();
+        assert!(can_admin_scope(&any, "anything"));
     }
 }

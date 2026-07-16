@@ -8,10 +8,20 @@
 //!
 //! There is no implicit inheritance — a company member does not automatically
 //! see every team's private memory; access is granted explicitly. This is the
-//! least-privilege default. The resolver does not (yet) gate retrieval; wiring it
-//! into the search filter is a separate, reviewed slice.
+//! least-privilege default. Slice 8b wires [`visible_scopes`] into the retrieval
+//! filter; slice 8c administers the grants themselves via the ACL endpoints.
 
 use crate::db::AclEntry;
+
+/// The recognized capabilities, in ascending strength. A grant carrying anything
+/// outside this set is rejected at the admin boundary (fail-closed) so a typo
+/// can't create an inert or surprising grant.
+pub const CAPABILITIES: [&str; 4] = ["read", "write", "promote", "admin"];
+
+/// Whether `capability` is one the system recognizes (see [`CAPABILITIES`]).
+pub fn is_valid_capability(capability: &str) -> bool {
+    CAPABILITIES.contains(&capability)
+}
 
 /// Capabilities that include the right to READ a scope's memory. `write`,
 /// `promote`, and `admin` all imply read; a bare unknown capability does not.
