@@ -131,6 +131,9 @@ impl VectorStore for QdrantStore {
     async fn delete_by_doc(&self, collection: &str, doc_id: &str) -> Result<(), String> {
         qdrant::delete_by_doc(&self.http, &self.url, &self.key, collection, doc_id).await
     }
+    async fn delete_by_ids(&self, collection: &str, ids: &[String]) -> Result<(), String> {
+        qdrant::delete_by_ids(&self.http, &self.url, &self.key, collection, ids).await
+    }
     async fn delete_collection(&self, name: &str) -> Result<(), String> {
         qdrant::delete_collection(&self.http, &self.url, &self.key, name).await
     }

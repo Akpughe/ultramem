@@ -591,6 +591,38 @@ pub async fn delete_by_doc(
     Ok(())
 }
 
+/// Delete points by their exact ids (fact-granular forget). Ownership must be
+/// verified by the caller before calling this — a raw id delete is unconditional.
+pub async fn delete_by_ids(
+    http: &reqwest::Client,
+    base: &str,
+    key: &str,
+    collection: &str,
+    ids: &[String],
+) -> Result<(), String> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let resp = req(
+        http,
+        reqwest::Method::POST,
+        base,
+        key,
+        &format!("/collections/{collection}/points/delete?wait=true"),
+    )
+    .json(&json!({ "points": ids }))
+    .send()
+    .await
+    .map_err(|e| format!("qdrant unreachable: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "qdrant id delete from {collection} failed: {}",
+            resp.status()
+        ));
+    }
+    Ok(())
+}
+
 /// Drop a whole collection (used by the benchmark to clean up after itself).
 pub async fn delete_collection(
     http: &reqwest::Client,

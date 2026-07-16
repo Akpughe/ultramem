@@ -250,6 +250,19 @@ impl Db for MockDb {
             .filter(|m| m.container_tag == container_tag)
             .cloned())
     }
+    async fn delete_memory(&self, id: &str, container_tag: &str) -> Result<bool, String> {
+        let mut memories = self.memories.lock().unwrap();
+        let owned = memories
+            .get(id)
+            .map(|m| m.container_tag == container_tag)
+            .unwrap_or(false);
+        if !owned {
+            return Ok(false);
+        }
+        memories.remove(id);
+        self.evidence.lock().unwrap().retain(|e| e.memory_id != id);
+        Ok(true)
+    }
     async fn grant_acl(&self, entry: &AclEntry) -> Result<(), String> {
         let mut acls = self.acls.lock().unwrap();
         if !acls.iter().any(|a| {

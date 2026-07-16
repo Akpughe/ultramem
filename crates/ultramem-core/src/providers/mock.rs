@@ -341,6 +341,19 @@ impl VectorStore for MemStore {
         Ok(())
     }
 
+    async fn delete_by_ids(&self, collection: &str, ids: &[String]) -> Result<(), String> {
+        let mut cols = self.cols.lock().unwrap();
+        if let Some(pts) = cols.get_mut(collection) {
+            pts.retain(|p| {
+                !p["id"]
+                    .as_str()
+                    .map(|id| ids.iter().any(|x| x == id))
+                    .unwrap_or(false)
+            });
+        }
+        Ok(())
+    }
+
     async fn delete_collection(&self, name: &str) -> Result<(), String> {
         self.cols.lock().unwrap().remove(name);
         Ok(())

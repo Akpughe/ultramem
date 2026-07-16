@@ -116,6 +116,7 @@ async fn main() {
         )
         .route("/v1/memories/:id", axum::routing::delete(delete_memory))
         .route("/v1/memories/:id/promote", post(promote_memory))
+        .route("/v1/facts/:id", axum::routing::delete(forget_fact))
         .route("/v1/search", post(search))
         .route("/v1/profile", get(profile))
         .route("/v1/timeline", get(timeline))
@@ -644,6 +645,27 @@ async fn job_status(
     match state.engine.job_get(&id, &tag).await {
         Some(job) => Json(job).into_response(),
         None => not_found(),
+    }
+}
+
+/// `DELETE /v1/facts/:id?container_tag=…` — fact-granular forget (right-to-erasure).
+/// Hard-removes a single distilled memory (and its evidence) from the vector index
+/// AND the relational source of truth, scoped to the caller's namespace. A fact in
+/// another tenant's namespace returns `404` (and is untouched). Requires Postgres.
+async fn forget_fact(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Query(q): Query<TagQuery>,
+    Path(id): Path<String>,
+) -> Response {
+    let tag = match resolve_tag(&ctx, &q.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
+    match state.engine.forget_memory(&tag, &id).await {
+        Ok(true) => Json(json!({ "ok": true })).into_response(),
+        Ok(false) => not_found(),
+        Err(e) => err(e),
     }
 }
 

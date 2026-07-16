@@ -135,6 +135,15 @@ backend); administering a scope your credential can't act as returns `403`.
 - `GET /v1/acl?scope=team_eng` → `{ "grants": [ { principal, scope, capability, created_at } ] }`
   — who may access the scope.
 
+### `DELETE /v1/facts/:id?container_tag=…` — forget one fact (requires Postgres)
+Fact-granular **right-to-erasure**: hard-removes a single distilled memory (and its
+evidence) from **both** the vector index and the relational source of truth, scoped to
+the caller's namespace. Ownership is verified against Postgres first, so a fact in another
+tenant's namespace returns `404` and is untouched — never a cross-tenant erasure. The
+searchable vector is erased before the relational row, so a forgotten fact can't be
+resurrected by a later index rebuild, and a mid-way failure is retry-safe. This is the
+fact-level counterpart to document-level `DELETE /v1/memories/:id`.
+
 ### `POST /v1/memories/:id/promote` — share into a company scope (requires Postgres)
 Copy a memory from the caller's own scope into a shared **scope** it holds the `promote`
 (or `admin`) capability on. Body: `{ "to_scope": "team_eng", "container_tag": "user_a" }`

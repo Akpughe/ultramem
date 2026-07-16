@@ -1597,6 +1597,40 @@ impl MemoryEngine {
         Ok(Some(new_id))
     }
 
+    /// Fact-granular **forget** (right-to-erasure): hard-delete a single memory
+    /// from both the vector index and the relational source of truth, scoped to
+    /// the caller's namespace. Ownership is verified against the source of truth,
+    /// so a wrong-tenant id is a no-op (`Ok(false)`) — never a cross-tenant
+    /// erasure. Returns whether a memory was removed.
+    ///
+    /// Ordering is retry-safe: the read gate (`get_memory`) re-checks on every
+    /// call, then the searchable vector is erased *before* the relational row, so
+    /// a forgotten fact can never be resurrected by a later index rebuild and a
+    /// mid-way failure can simply be retried.
+    ///
+    /// Requires a relational store (the ownership gate). Document-level
+    /// [`Self::delete_document_tagged`] remains for Qdrant-only deployments.
+    pub async fn forget_memory(&self, tag: &str, memory_id: &str) -> Result<bool, String> {
+        let cfg = self.cfg();
+        let Some(db) = &self.db else {
+            return Err(
+                "fact-level forget requires a relational store (set ULTRAMEM_PG_URL)".into(),
+            );
+        };
+        // Ownership gate (read-only, so a retry after a partial failure re-checks).
+        if db.get_memory(memory_id, tag).await?.is_none() {
+            return Ok(false);
+        }
+        let ids = [memory_id.to_string()];
+        // Erase the searchable vector first, then the source of truth.
+        self.store
+            .delete_by_ids(&cfg.facts_collection, &ids)
+            .await?;
+        db.delete_memory(memory_id, tag).await?;
+        self.audit(tag, "forget", Some(memory_id)).await;
+        Ok(true)
+    }
+
     /// Whether a relational source of truth is attached (jobs/provenance require it).
     pub fn has_db(&self) -> bool {
         self.db.is_some()
@@ -4132,6 +4166,93 @@ mod pipeline_tests {
                 .await
                 .is_err());
             assert!(!bare.can_promote("alice", "company").await);
+        });
+    }
+
+    /// 8/10 slice 8e — fact-granular forget (right-to-erasure). A memory is
+    /// hard-removed from BOTH the vector index and the relational store, scoped
+    /// to the caller's namespace, and its evidence goes with it. A wrong-tenant id
+    /// is a no-op (never a cross-tenant erasure). Offline.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn forget_erases_memory_from_index_and_source_of_truth() {
+        use crate::db::mock::MockDb;
+        use crate::db::{Db, EvidenceRow, MemoryRow};
+        use crate::providers::mock::MemStore;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = EngineCfg::default();
+            cfg.facts_collection = "f".into();
+            let store = Arc::new(MemStore::new());
+            let db = Arc::new(MockDb::new());
+            let engine = MemoryEngine::new(cfg)
+                .with_store(store.clone())
+                .with_db(db.clone());
+
+            // A memory in alice's scope: a PG row, its vector point, and evidence.
+            let mem = |id: &str, tag: &str| MemoryRow {
+                id: id.into(),
+                container_tag: tag.into(),
+                kind: "fact".into(),
+                statement: format!("statement {id}"),
+                confidence: Some(0.8),
+                is_latest: true,
+                needs_review: false,
+                supersedes: None,
+                superseded_by: None,
+                extends: None,
+                event_from: None,
+                valid_until: None,
+                learned_at: 1,
+                document_id: "d1".into(),
+                created_at: 1,
+            };
+            db.insert_memories(&[mem("m1", "alice"), mem("m2", "alice")])
+                .await
+                .unwrap();
+            db.insert_evidence(&[EvidenceRow {
+                id: "e1".into(),
+                memory_id: "m1".into(),
+                document_id: "d1".into(),
+                chunk_id: None,
+                char_start: None,
+                char_end: None,
+                quote: "secret".into(),
+                extractor: "distill".into(),
+            }])
+            .await
+            .unwrap();
+            store
+                .upsert(
+                    "f",
+                    vec![
+                        json!({"id":"m1","vector":[0.0],"payload":{"fact":"statement m1","container_tag":"alice","is_latest":true}}),
+                        json!({"id":"m2","vector":[0.0],"payload":{"fact":"statement m2","container_tag":"alice","is_latest":true}}),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            // Wrong tenant cannot forget it — no-op, and nothing is removed.
+            assert!(!engine.forget_memory("mallory", "m1").await.unwrap());
+            assert!(db.memory("m1").is_some(), "cross-tenant forget must not erase");
+            assert_eq!(store.count("f"), 2);
+
+            // Owner forgets m1 → gone from PG, its evidence gone, vector gone.
+            assert!(engine.forget_memory("alice", "m1").await.unwrap());
+            assert!(db.memory("m1").is_none());
+            assert!(db.evidence().iter().all(|e| e.memory_id != "m1"));
+            assert_eq!(store.count("f"), 1, "the forgotten vector is erased");
+            // The sibling memory is untouched.
+            assert!(db.memory("m2").is_some());
+
+            // Forgetting an already-gone id is a clean no-op (idempotent/retry-safe).
+            assert!(!engine.forget_memory("alice", "m1").await.unwrap());
+
+            // No relational store → fact-level forget is unavailable.
+            let bare =
+                MemoryEngine::new(EngineCfg::default()).with_store(Arc::new(MemStore::new()));
+            assert!(bare.forget_memory("alice", "m1").await.is_err());
         });
     }
 }
