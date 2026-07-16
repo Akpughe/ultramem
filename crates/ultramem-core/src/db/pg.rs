@@ -429,6 +429,19 @@ impl Db for PgDb {
         Ok(())
     }
 
+    async fn revoke_acl(&self, e: &AclEntry) -> Result<(), String> {
+        sqlx::query(
+            "delete from acl_entries where principal = $1 and scope = $2 and capability = $3",
+        )
+        .bind(&e.principal)
+        .bind(&e.scope)
+        .bind(&e.capability)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| format!("revoke_acl failed: {err}"))?;
+        Ok(())
+    }
+
     async fn acls_for_principal(&self, principal: &str) -> Result<Vec<AclEntry>, String> {
         let rows = sqlx::query(
             "select principal, scope, capability, created_at from acl_entries where principal = $1",
@@ -437,6 +450,25 @@ impl Db for PgDb {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| format!("acls_for_principal failed: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AclEntry {
+                principal: r.get("principal"),
+                scope: r.get("scope"),
+                capability: r.get("capability"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
+    async fn acls_for_scope(&self, scope: &str) -> Result<Vec<AclEntry>, String> {
+        let rows = sqlx::query(
+            "select principal, scope, capability, created_at from acl_entries where scope = $1",
+        )
+        .bind(scope)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("acls_for_scope failed: {e}"))?;
         Ok(rows
             .into_iter()
             .map(|r| AclEntry {

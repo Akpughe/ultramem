@@ -202,6 +202,10 @@ pub trait Db: Send + Sync {
     ) -> Result<Vec<MemoryRow>, String>;
     /// Grant a principal a capability on a scope (idempotent).
     async fn grant_acl(&self, entry: &AclEntry) -> Result<(), String>;
+    /// Revoke a specific grant (idempotent — an absent grant is a no-op).
+    async fn revoke_acl(&self, entry: &AclEntry) -> Result<(), String>;
     /// All ACL grants held by a principal.
     async fn acls_for_principal(&self, principal: &str) -> Result<Vec<AclEntry>, String>;
+    /// All grants *on* a scope (who may access it) — for the admin listing.
+    async fn acls_for_scope(&self, scope: &str) -> Result<Vec<AclEntry>, String>;
 }
