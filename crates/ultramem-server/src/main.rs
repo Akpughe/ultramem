@@ -49,14 +49,18 @@ async fn main() {
     let cfg = EngineCfg::from_env();
     let mut engine = MemoryEngine::new(cfg.clone());
     // Phase A: attach the Postgres source of truth when configured. Connect +
-    // migrate at startup; a failure logs and falls back to Qdrant-only rather
-    // than blocking the server.
+    // migrate at startup; a failure logs and falls back to Qdrant-only — UNLESS
+    // ULTRAMEM_PG_REQUIRED=1, which makes the server refuse to start rather than
+    // silently degrade (the production cutover posture).
+    let pg_required = std::env::var("ULTRAMEM_PG_REQUIRED").as_deref() == Ok("1");
+    let mut pg_attached = false;
     if let Some(pg_url) = &cfg.pg_url {
         use ultramem_core::db::Db;
         match ultramem_core::db::PgDb::connect(pg_url).await {
             Ok(db) => match db.migrate().await {
                 Ok(()) => {
                     engine = engine.with_db(std::sync::Arc::new(db));
+                    pg_attached = true;
                     println!("[ultramem] Postgres source of truth attached (dual-write enabled)");
                 }
                 Err(e) => eprintln!("[ultramem] WARNING: pg migrate failed ({e}); running Qdrant-only"),
@@ -65,6 +69,14 @@ async fn main() {
                 "[ultramem] WARNING: ULTRAMEM_PG_URL set but connect failed ({e}); running Qdrant-only"
             ),
         }
+    }
+    if should_fail_fast_on_pg(cfg.pg_url.is_some(), pg_attached, pg_required) {
+        eprintln!(
+            "[ultramem] FATAL: ULTRAMEM_PG_REQUIRED=1 but the Postgres source of truth could not \
+             be attached. Refusing to run Qdrant-only. Fix ULTRAMEM_PG_URL / the database, or unset \
+             ULTRAMEM_PG_REQUIRED to allow the fallback."
+        );
+        std::process::exit(1);
     }
     // Qdrant may still be starting (e.g. `docker compose up` boots both at once),
     // so retry rather than give up — collections must exist before the first write.
@@ -199,6 +211,12 @@ struct AddBody {
     /// file-disclosure risk. Present only so the server can return a clear `400`;
     /// local file ingestion stays available through the embedded Rust engine API.
     file_path: Option<Value>,
+}
+
+/// Abort startup when Postgres is configured but couldn't be attached and the
+/// operator required it (the cutover fail-fast, vs the silent Qdrant-only fallback).
+fn should_fail_fast_on_pg(pg_configured: bool, pg_attached: bool, pg_required: bool) -> bool {
+    pg_configured && !pg_attached && pg_required
 }
 
 /// Reject a JSON ingest that tries to name a server-side `file_path` (SS-3).
@@ -623,6 +641,18 @@ mod tests {
             captured_at: None,
             file_path,
         }
+    }
+
+    #[test]
+    fn fail_fast_only_when_required_and_unattached() {
+        // Required + configured + not attached → abort.
+        assert!(should_fail_fast_on_pg(true, false, true));
+        // Attached → fine.
+        assert!(!should_fail_fast_on_pg(true, true, true));
+        // Not required → tolerate the fallback.
+        assert!(!should_fail_fast_on_pg(true, false, false));
+        // Not configured → nothing to require.
+        assert!(!should_fail_fast_on_pg(false, false, true));
     }
 
     #[test]

@@ -124,6 +124,27 @@ credential doesn't own returns `403`. Maps to `delete_document_tagged`.
 → `{ "ok": true }` (no auth). Maps to `MemoryEngine::health` (Qdrant reachability + a
 provider-key presence check).
 
+## Source of truth (Postgres, Phase A)
+
+Set `ULTRAMEM_PG_URL` to run Postgres as the relational **source of truth**. When
+configured, the engine additionally:
+
+- **dual-writes** each ingest — `documents`, `chunks`, typed `memories`
+  (kind/confidence), and grounded `memory_evidence` (validated verbatim source
+  spans) — and **dedups** documents by content hash / canonical URL;
+- serves `/v1/timeline` and search `provenance` from indexed Postgres queries
+  (no full-collection scans);
+- tracks background work as `jobs` (`GET /v1/jobs/:id`) and records an
+  `audit_events` trail of mutating operations;
+- treats **Qdrant as a rebuildable index**: `POST /v1/reindex {"mode":"backfill"}`
+  migrates existing Qdrant data into Postgres, and `{"mode":"rebuild"}`
+  regenerates Qdrant from Postgres — so losing Qdrant is recoverable, not data loss.
+
+With `ULTRAMEM_PG_URL` **unset**, the engine runs Qdrant-only exactly as before.
+Set `ULTRAMEM_PG_REQUIRED=1` to make the server refuse to start (rather than
+silently fall back to Qdrant-only) if Postgres can't be attached — the recommended
+production posture.
+
 ## Provider config (env)
 `QDRANT_URL`, `QDRANT_API_KEY`, `JINA_API_KEY`, `MISTRAL_API_KEY`, and the LLM provider keys (Groq/OpenAI/Anthropic/Ollama via `llm.rs`). Once the provider traits land (ROADMAP Phase 3) these become swappable per-deployment.
 
