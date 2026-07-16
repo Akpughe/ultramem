@@ -39,16 +39,25 @@ as before — access only ever *expands* via an explicit `grant_acl`.
   or a company scope it wasn't given. Every grant/revoke is audited. Documented in
   `docs/API.md`.
 
+- **8d — promotion (private→shared)** (branch `scopes-8d-promote`) — the *write*
+  side of the company brain. `POST /v1/memories/:id/promote {to_scope}` copies a
+  memory from the caller's own scope into a shared scope it holds `promote`/`admin`
+  on: re-embedded into the shared namespace, provenance linked back to the origin
+  (`extends` = source memory id, source `document_id` preserved), origin untouched.
+  Adds `Db::get_memory` (PG + Mock), `scope::can_promote` (only `promote`/`admin`
+  confer it — `read`/`write` do **not**), engine `promote_memory` + `can_promote`,
+  and the endpoint (fail-closed authz + `404` for a non-owned source). Audited.
+
 ### Verified (this machine)
 `cargo fmt --check`, `clippy --all-targets -D warnings`, `cargo test --workspace
---all-targets` (129 core + 13 server) + `--doc` all green. 8b/8c added 6 tests
-(scope-filter no-op + leak, resolver, ACL round-trip, revoke/by-scope, admin-authz).
+--all-targets` (131 core + 13 server) + `--doc` all green. 8b–8d added 9 tests
+(scope-filter no-op + leak, resolver, ACL round-trip, revoke/by-scope, admin-authz,
+promote-capability, promote round-trip with provenance).
 
 ### Next (remaining 8/10)
-Promotion flow (private→shared via the `promote` capability: copy a personal memory
-into a shared scope with a provenance link), memory review/edit/pin/reject/forget
-endpoints, per-scope profile entries — then 9/10 (temporal graph on in prod, entity
-resolution, bitemporal `as_of`).
+Memory review/edit/pin/reject/forget endpoints (per-memory lifecycle beyond
+document-level delete), per-scope profile entries — then 9/10 (temporal graph on in
+prod, entity resolution, bitemporal `as_of` queries).
 
 ---
 

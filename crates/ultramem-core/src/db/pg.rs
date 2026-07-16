@@ -517,6 +517,37 @@ impl Db for PgDb {
             })
             .collect())
     }
+
+    async fn get_memory(&self, id: &str, container_tag: &str) -> Result<Option<MemoryRow>, String> {
+        let row = sqlx::query(
+            "select id, container_tag, kind, statement, confidence, is_latest, needs_review, \
+             supersedes, superseded_by, extends, event_from, valid_until, learned_at, \
+             document_id, created_at \
+             from memories where id = $1 and container_tag = $2",
+        )
+        .bind(id)
+        .bind(container_tag)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_memory failed: {e}"))?;
+        Ok(row.map(|r| MemoryRow {
+            id: r.get("id"),
+            container_tag: r.get("container_tag"),
+            kind: r.get("kind"),
+            statement: r.get("statement"),
+            confidence: r.get("confidence"),
+            is_latest: r.get("is_latest"),
+            needs_review: r.get("needs_review"),
+            supersedes: r.get("supersedes"),
+            superseded_by: r.get("superseded_by"),
+            extends: r.get("extends"),
+            event_from: r.get("event_from"),
+            valid_until: r.get("valid_until"),
+            learned_at: r.get("learned_at"),
+            document_id: r.get("document_id"),
+            created_at: r.get("created_at"),
+        }))
+    }
 }
 
 #[cfg(test)]

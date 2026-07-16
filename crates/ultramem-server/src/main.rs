@@ -115,6 +115,7 @@ async fn main() {
             post(add_memory).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route("/v1/memories/:id", axum::routing::delete(delete_memory))
+        .route("/v1/memories/:id/promote", post(promote_memory))
         .route("/v1/search", post(search))
         .route("/v1/profile", get(profile))
         .route("/v1/timeline", get(timeline))
@@ -643,6 +644,44 @@ async fn job_status(
     match state.engine.job_get(&id, &tag).await {
         Some(job) => Json(job).into_response(),
         None => not_found(),
+    }
+}
+
+// ── promotion: private → shared (8/10 scopes, slice 8d) ──────────────────────
+#[derive(Deserialize)]
+struct PromoteBody {
+    /// The shared scope to copy the memory into (caller needs `promote`/`admin` on it).
+    to_scope: String,
+    /// The caller's own namespace the memory lives in (defaults per credential).
+    container_tag: Option<String>,
+}
+
+/// `POST /v1/memories/:id/promote` — copy a memory from the caller's own scope
+/// into a shared scope it holds `promote`/`admin` on. `403` without that grant;
+/// `404` if the memory isn't in the caller's scope.
+async fn promote_memory(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Path(id): Path<String>,
+    Json(b): Json<PromoteBody>,
+) -> Response {
+    let from_tag = match resolve_tag(&ctx, &b.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
+    if !state.engine.can_promote(&from_tag, &b.to_scope).await {
+        return forbidden();
+    }
+    match state
+        .engine
+        .promote_memory(&from_tag, &id, &b.to_scope)
+        .await
+    {
+        Ok(Some(new_id)) => {
+            Json(json!({ "ok": true, "id": new_id, "scope": b.to_scope })).into_response()
+        }
+        Ok(None) => not_found(),
+        Err(e) => err(e),
     }
 }
 

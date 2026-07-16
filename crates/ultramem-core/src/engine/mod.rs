@@ -1506,6 +1506,97 @@ impl MemoryEngine {
         db.acls_for_scope(scope).await
     }
 
+    /// Whether `principal` may promote a memory INTO `to_scope` (needs an explicit
+    /// `promote`/`admin` grant — see [`crate::scope::can_promote`]). Fail-closed:
+    /// no Db → `false`.
+    pub async fn can_promote(&self, principal: &str, to_scope: &str) -> bool {
+        let Some(db) = &self.db else {
+            return false;
+        };
+        let acls = db.acls_for_principal(principal).await.unwrap_or_default();
+        crate::scope::can_promote(principal, to_scope, &acls)
+    }
+
+    /// Promote a memory from the caller's own scope (`from_tag`) into a shared
+    /// `to_scope`: copy the fact into the shared namespace (a new id, re-embedded
+    /// so it is independently searchable there), preserving statement/kind/
+    /// confidence/expiry and linking provenance back to the origin memory
+    /// (`extends` = source id, source `document_id` preserved). Returns the new
+    /// memory id, or `Ok(None)` if the source memory doesn't exist in `from_tag`.
+    ///
+    /// Authorization (the caller must hold `promote`/`admin` on `to_scope`) is the
+    /// API boundary's job via [`Self::can_promote`]; this method assumes it passed.
+    /// Requires a relational store (the source of truth for the source memory).
+    pub async fn promote_memory(
+        &self,
+        from_tag: &str,
+        memory_id: &str,
+        to_scope: &str,
+    ) -> Result<Option<String>, String> {
+        let cfg = self.cfg();
+        let Some(db) = &self.db else {
+            return Err("promotion requires a relational store (set ULTRAMEM_PG_URL)".into());
+        };
+        // The source must live in the caller's OWN scope — no cross-scope read here.
+        let Some(src) = db.get_memory(memory_id, from_tag).await? else {
+            return Ok(None);
+        };
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        // Re-embed so the shared-scope point stands on its own in that namespace.
+        let vecs = self
+            .embedder
+            .embed(EmbedTask::Passage, std::slice::from_ref(&src.statement))
+            .await?;
+        let vec = vecs
+            .into_iter()
+            .next()
+            .ok_or("no embedding for promoted fact")?;
+        let point = json!({
+            "id": new_id,
+            "vector": vec,
+            "payload": {
+                "doc_id": src.document_id,
+                "fact": src.statement,
+                "kind": src.kind,
+                "is_latest": true,
+                "needs_review": false,
+                "supersedes": null,
+                "extends": src.id,
+                "valid_until": src.valid_until,
+                "container_tag": to_scope,
+                "promoted_from": src.id,
+                "promoted_from_scope": from_tag,
+            },
+        });
+        self.store
+            .upsert(&cfg.facts_collection, vec![point])
+            .await?;
+        // Mirror into the relational store (non-fatal — a rebuild reconciles drift).
+        let row = crate::db::MemoryRow {
+            id: new_id.clone(),
+            container_tag: to_scope.to_string(),
+            kind: src.kind.clone(),
+            statement: src.statement.clone(),
+            confidence: src.confidence,
+            is_latest: true,
+            needs_review: false,
+            supersedes: None,
+            superseded_by: None,
+            extends: Some(src.id.clone()),
+            event_from: src.event_from,
+            valid_until: src.valid_until,
+            learned_at: now,
+            document_id: src.document_id.clone(),
+            created_at: now,
+        };
+        if let Err(e) = db.insert_memories(std::slice::from_ref(&row)).await {
+            eprintln!("[ultramem] pg insert_memories (promote) failed: {e}");
+        }
+        self.audit(to_scope, "promote", Some(&new_id)).await;
+        Ok(Some(new_id))
+    }
+
     /// Whether a relational source of truth is attached (jobs/provenance require it).
     pub fn has_db(&self) -> bool {
         self.db.is_some()
@@ -3941,6 +4032,106 @@ mod pipeline_tests {
                 MemoryEngine::new(EngineCfg::default()).with_store(Arc::new(MemStore::new()));
             assert!(bare.acl_grant("alice", "team", "read").await.is_err());
             assert!(bare.acls_for_scope("team").await.is_err());
+        });
+    }
+
+    /// 8/10 slice 8d — promotion (private→shared). A memory in the caller's own
+    /// scope is copied into a shared scope the caller holds `promote` on: a new
+    /// row lands in the shared namespace, provenance links back to the origin,
+    /// and it becomes visible when read from the shared scope. Read/write grants
+    /// do NOT authorize promotion; a missing source is a clean `None`. Offline.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn promote_copies_into_shared_scope_with_provenance() {
+        use crate::db::mock::MockDb;
+        use crate::db::{Db, MemoryRow};
+        use crate::providers::mock::{MemStore, MockEmbedder};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = EngineCfg::default();
+            cfg.facts_collection = "f".into();
+            let db = Arc::new(MockDb::new());
+            let engine = MemoryEngine::new(cfg)
+                .with_store(Arc::new(MemStore::new()))
+                .with_embedder(Arc::new(MockEmbedder { dim: 8 }))
+                .with_db(db.clone());
+
+            // A personal memory in alice's own scope.
+            let src = MemoryRow {
+                id: "m-src".into(),
+                container_tag: "alice".into(),
+                kind: "preference".into(),
+                statement: "the API rate limit is 100 rps".into(),
+                confidence: Some(0.9),
+                is_latest: true,
+                needs_review: false,
+                supersedes: None,
+                superseded_by: None,
+                extends: None,
+                event_from: None,
+                valid_until: None,
+                learned_at: 1,
+                document_id: "d1".into(),
+                created_at: 1,
+            };
+            db.insert_memories(std::slice::from_ref(&src))
+                .await
+                .unwrap();
+
+            // Not authorized without a promote/admin grant — even a read grant.
+            db.grant_acl(&crate::db::AclEntry {
+                principal: "alice".into(),
+                scope: "company".into(),
+                capability: "read".into(),
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+            assert!(
+                !engine.can_promote("alice", "company").await,
+                "read grant must NOT authorize promotion"
+            );
+
+            // Grant promote → authorized, and the promotion lands in the shared scope.
+            engine
+                .acl_grant("alice", "company", "promote")
+                .await
+                .unwrap();
+            assert!(engine.can_promote("alice", "company").await);
+
+            let new_id = engine
+                .promote_memory("alice", "m-src", "company")
+                .await
+                .unwrap()
+                .expect("source exists → promoted");
+            let promoted = db.memory(&new_id).expect("promoted row exists");
+            assert_eq!(promoted.container_tag, "company");
+            assert_eq!(promoted.statement, src.statement);
+            assert_eq!(promoted.kind, "preference");
+            assert_eq!(
+                promoted.extends,
+                Some("m-src".to_string()),
+                "provenance must link back to the origin memory"
+            );
+            assert_eq!(promoted.document_id, "d1", "source document preserved");
+            // The origin is untouched (still in alice's scope, unchanged).
+            assert_eq!(db.memory("m-src").unwrap().container_tag, "alice");
+
+            // A missing source id is a clean not-found, not an error.
+            assert!(engine
+                .promote_memory("alice", "nope", "company")
+                .await
+                .unwrap()
+                .is_none());
+
+            // No relational store → promotion is unavailable.
+            let bare =
+                MemoryEngine::new(EngineCfg::default()).with_store(Arc::new(MemStore::new()));
+            assert!(bare
+                .promote_memory("alice", "m-src", "company")
+                .await
+                .is_err());
+            assert!(!bare.can_promote("alice", "company").await);
         });
     }
 }

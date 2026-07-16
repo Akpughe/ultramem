@@ -135,6 +135,16 @@ backend); administering a scope your credential can't act as returns `403`.
 - `GET /v1/acl?scope=team_eng` → `{ "grants": [ { principal, scope, capability, created_at } ] }`
   — who may access the scope.
 
+### `POST /v1/memories/:id/promote` — share into a company scope (requires Postgres)
+Copy a memory from the caller's own scope into a shared **scope** it holds the `promote`
+(or `admin`) capability on. Body: `{ "to_scope": "team_eng", "container_tag": "user_a" }`
+(the `container_tag` is the caller's own namespace; defaults per credential). The fact is
+re-embedded into the shared namespace and provenance links back to the origin memory
+(`extends`) and its source document. Returns `{ "ok": true, "id": "<new>", "scope": "team_eng" }`.
+`403` without a `promote`/`admin` grant on `to_scope`; `404` if the memory isn't in the
+caller's scope. `read`/`write` grants do **not** authorize promotion — writing into a shared
+brain is a higher bar than reading it.
+
 ### `GET /v1/health`
 → `{ "ok": true }` (no auth). Maps to `MemoryEngine::health` (Qdrant reachability + a
 provider-key presence check).
