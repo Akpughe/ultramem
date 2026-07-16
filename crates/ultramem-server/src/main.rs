@@ -117,6 +117,7 @@ async fn main() {
         .route("/v1/memories/:id", axum::routing::delete(delete_memory))
         .route("/v1/memories/:id/promote", post(promote_memory))
         .route("/v1/facts/:id", axum::routing::delete(forget_fact))
+        .route("/v1/memories/as_of", get(memories_as_of))
         .route("/v1/search", post(search))
         .route("/v1/profile", get(profile))
         .route("/v1/timeline", get(timeline))
@@ -646,6 +647,44 @@ async fn job_status(
         Some(job) => Json(job).into_response(),
         None => not_found(),
     }
+}
+
+// ── bitemporal as-of (9/10 temporal, slice 9a) ───────────────────────────────
+#[derive(Deserialize)]
+struct AsOfQuery {
+    container_tag: Option<String>,
+    /// Transaction time (unix seconds) to reconstruct the memory state as of.
+    t: i64,
+    limit: Option<i64>,
+}
+
+/// `GET /v1/memories/as_of?t=…&container_tag=…` — point-in-time read: the memories
+/// that were current knowledge as of transaction time `t` (learned by then, not yet
+/// superseded, still valid, not quarantined). Answers "what did we know as of `t`",
+/// not just the present. Requires Postgres (empty otherwise).
+async fn memories_as_of(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Query(q): Query<AsOfQuery>,
+) -> Response {
+    let tag = match resolve_tag(&ctx, &q.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    let rows = state.engine.memories_as_of(&tag, q.t, limit).await;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|m| {
+            json!({
+                "statement": m.statement,
+                "kind": m.kind,
+                "confidence": m.confidence,
+                "learned_at": m.learned_at,
+            })
+        })
+        .collect();
+    Json(json!({ "as_of": q.t, "memories": items })).into_response()
 }
 
 /// `DELETE /v1/facts/:id?container_tag=…` — fact-granular forget (right-to-erasure).

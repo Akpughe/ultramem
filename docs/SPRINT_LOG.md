@@ -5,7 +5,23 @@ entry records what changed, what was verified, and what the next sprint is.
 
 ---
 
-## 8/10 scopes — company-brain multi-scope (IN PROGRESS)
+## 9/10 temporal — bitemporal correctness (IN PROGRESS)
+
+- **9a — transaction-time `as_of`** (branch `temporal-9a-as-of`) — point-in-time
+  recall: reconstruct "what we knew as of time `t`", not just the present. Adds a
+  `superseded_at` timestamp to memories (migration `0003`; `mark_superseded` now
+  stamps it, threading the txn time from the engine), a `Db::memories_as_of(tag, t,
+  cap)` query (learned ≤ `t`, not yet superseded as of `t`, still valid at `t`, not
+  quarantined; PG + Mock), the engine wrapper, and `GET /v1/memories/as_of?t=`. The
+  live vector search stays current-only — this reads the Postgres source of truth,
+  so it's additive and inert for Qdrant-only deployments. Bitemporal test proves a
+  since-superseded fact surfaces for a time before its correction and disappears
+  after, an expiring fact drops at `valid_until`, and quarantined/other-tenant rows
+  never appear. Documented in `docs/API.md`.
+
+---
+
+## 8/10 scopes — company-brain multi-scope (COMPLETE)
 
 Fail-closed access model: a "scope" is a `container_tag`; a principal sees its own
 scope plus scopes it has been **explicitly** granted read (or higher) on. No

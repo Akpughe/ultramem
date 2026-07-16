@@ -128,12 +128,13 @@ impl Db for MockDb {
         }
         Ok(())
     }
-    async fn mark_superseded(&self, pairs: &[(String, String)]) -> Result<(), String> {
+    async fn mark_superseded(&self, pairs: &[(String, String)], ts: i64) -> Result<(), String> {
         let mut store = self.memories.lock().unwrap();
         for (old_id, new_id) in pairs {
             if let Some(m) = store.get_mut(old_id) {
                 m.is_latest = false;
                 m.superseded_by = Some(new_id.clone());
+                m.superseded_at = Some(ts);
             }
         }
         Ok(())
@@ -240,6 +241,30 @@ impl Db for MockDb {
             .take(cap.max(0) as usize)
             .cloned()
             .collect())
+    }
+    async fn memories_as_of(
+        &self,
+        container_tag: &str,
+        t: i64,
+        cap: i64,
+    ) -> Result<Vec<MemoryRow>, String> {
+        let mut rows: Vec<MemoryRow> = self
+            .memories
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|m| {
+                m.container_tag == container_tag
+                    && !m.needs_review
+                    && m.learned_at <= t
+                    && m.superseded_at.map(|s| s > t).unwrap_or(true)
+                    && m.valid_until.map(|v| v > t).unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|m| std::cmp::Reverse(m.learned_at));
+        rows.truncate(cap.max(0) as usize);
+        Ok(rows)
     }
     async fn get_memory(&self, id: &str, container_tag: &str) -> Result<Option<MemoryRow>, String> {
         Ok(self
@@ -390,6 +415,87 @@ mod tests {
             assert_eq!(team[0].principal, "u2");
             // The unrelated grant on another scope is untouched.
             assert_eq!(db.acls_for_scope("other").await.unwrap().len(), 1);
+        });
+    }
+
+    fn mem(id: &str, tag: &str, learned_at: i64) -> MemoryRow {
+        MemoryRow {
+            id: id.into(),
+            container_tag: tag.into(),
+            kind: "fact".into(),
+            statement: format!("stmt {id}"),
+            confidence: None,
+            is_latest: true,
+            needs_review: false,
+            supersedes: None,
+            superseded_by: None,
+            superseded_at: None,
+            extends: None,
+            event_from: None,
+            valid_until: None,
+            learned_at,
+            document_id: "d1".into(),
+            created_at: learned_at,
+        }
+    }
+
+    #[test]
+    fn memories_as_of_is_bitemporal() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = MockDb::new();
+            // A: learned@10, superseded@20.
+            let a = mem("a", "t", 10);
+            // B: learned@10, expires (valid_until)@30.
+            let mut b = mem("b", "t", 10);
+            b.valid_until = Some(30);
+            // C: learned@10 but quarantined — never part of any as-of view.
+            let mut c = mem("c", "t", 10);
+            c.needs_review = true;
+            // D: another tenant — must never appear in t's view.
+            let d = mem("d", "other", 10);
+            db.insert_memories(&[a, b, c, d]).await.unwrap();
+            db.mark_superseded(&[("a".into(), "a2".into())], 20)
+                .await
+                .unwrap();
+
+            let ids = |rows: Vec<MemoryRow>| {
+                let mut v: Vec<String> = rows.into_iter().map(|m| m.id).collect();
+                v.sort();
+                v
+            };
+
+            // As of 15: A is current (superseded later), B is valid → both.
+            assert_eq!(
+                ids(db.memories_as_of("t", 15, 100).await.unwrap()),
+                ["a", "b"]
+            );
+            // As of 25: A already superseded (@20), B still valid (@30) → only B.
+            assert_eq!(ids(db.memories_as_of("t", 25, 100).await.unwrap()), ["b"]);
+            // As of 35: A superseded, B expired → nothing.
+            assert!(db.memories_as_of("t", 35, 100).await.unwrap().is_empty());
+            // As of 5: nothing was learned yet.
+            assert!(db.memories_as_of("t", 5, 100).await.unwrap().is_empty());
+            // Quarantined C never appears; the other tenant's D never leaks in.
+            let all_t: Vec<String> = ids(db.memories_as_of("t", 100, 100).await.unwrap());
+            assert!(!all_t.contains(&"c".to_string()));
+            assert!(!all_t.contains(&"d".to_string()));
+        });
+    }
+
+    #[test]
+    fn mark_superseded_stamps_transaction_time() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = MockDb::new();
+            db.insert_memories(&[mem("a", "t", 1)]).await.unwrap();
+            db.mark_superseded(&[("a".into(), "a2".into())], 42)
+                .await
+                .unwrap();
+            let a = db.memory("a").unwrap();
+            assert!(!a.is_latest);
+            assert_eq!(a.superseded_by.as_deref(), Some("a2"));
+            assert_eq!(a.superseded_at, Some(42));
         });
     }
 

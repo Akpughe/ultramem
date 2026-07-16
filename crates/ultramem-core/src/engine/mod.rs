@@ -1047,6 +1047,7 @@ impl MemoryEngine {
                     needs_review,
                     supersedes: action.supersedes.clone(),
                     superseded_by: None,
+                    superseded_at: None,
                     extends: action.extends.clone(),
                     event_from: None,
                     valid_until,
@@ -1119,7 +1120,7 @@ impl MemoryEngine {
                 }
             }
             if !supersede_pairs.is_empty() {
-                if let Err(e) = db.mark_superseded(&supersede_pairs).await {
+                if let Err(e) = db.mark_superseded(&supersede_pairs, now).await {
                     eprintln!("[ultramem] pg mark_superseded failed: {e}");
                 }
             }
@@ -1583,6 +1584,7 @@ impl MemoryEngine {
             needs_review: false,
             supersedes: None,
             superseded_by: None,
+            superseded_at: None,
             extends: Some(src.id.clone()),
             event_from: src.event_from,
             valid_until: src.valid_until,
@@ -1629,6 +1631,17 @@ impl MemoryEngine {
         db.delete_memory(memory_id, tag).await?;
         self.audit(tag, "forget", Some(memory_id)).await;
         Ok(true)
+    }
+
+    /// Bitemporal point-in-time read: the memories that were **current knowledge**
+    /// as of transaction time `t` — learned at/before `t`, not yet superseded as of
+    /// `t`, still valid in the world at `t`, and not quarantined. Reconstructs "what
+    /// we knew as of `t`", not just the present. Empty without a relational store.
+    pub async fn memories_as_of(&self, tag: &str, t: i64, limit: i64) -> Vec<crate::db::MemoryRow> {
+        let Some(db) = &self.db else {
+            return Vec::new();
+        };
+        db.memories_as_of(tag, t, limit).await.unwrap_or_default()
     }
 
     /// Whether a relational source of truth is attached (jobs/provenance require it).
@@ -2176,6 +2189,7 @@ impl MemoryEngine {
                 needs_review: pl["needs_review"].as_bool().unwrap_or(false),
                 supersedes: pl["supersedes"].as_str().map(String::from),
                 superseded_by: None,
+                superseded_at: None,
                 extends: pl["extends"].as_str().map(String::from),
                 event_from: None,
                 valid_until: pl["valid_until"].as_i64(),
@@ -4101,6 +4115,7 @@ mod pipeline_tests {
                 needs_review: false,
                 supersedes: None,
                 superseded_by: None,
+                superseded_at: None,
                 extends: None,
                 event_from: None,
                 valid_until: None,
@@ -4200,6 +4215,7 @@ mod pipeline_tests {
                 needs_review: false,
                 supersedes: None,
                 superseded_by: None,
+                superseded_at: None,
                 extends: None,
                 event_from: None,
                 valid_until: None,

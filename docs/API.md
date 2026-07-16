@@ -101,6 +101,14 @@ Maps to `MemoryEngine::retrieve_tagged` (planner + multi-query + rerank + `is_la
 ### `GET /v1/timeline?container_tag=…&source=…&before=…&limit=60` — enumeration
 Complete newest-first list (not similarity top-K) for "what did I do this week". Backed by the new `list_document_ids` scroll (see EXTRACTION §3).
 
+### `GET /v1/memories/as_of?t=…&container_tag=…&limit=200` — point-in-time recall (requires Postgres)
+Bitemporal read: returns the memories that were **current knowledge as of transaction
+time `t`** (unix seconds) — learned by then, not yet superseded as of `t`, still valid in
+the world at `t`, and not quarantined. Answers *"what did we know as of `t`"*, not just the
+present, so a contradicted fact still surfaces for a time before it was corrected. Each item
+is `{ statement, kind, confidence, learned_at }`. Reads from the Postgres source of truth
+(empty without it); the live vector search stays current-only.
+
 ### `POST /v1/reindex` — reprocess without re-extraction
 ```jsonc
 { "container_tag": "string?", "mode": "tags|latest|facts" }

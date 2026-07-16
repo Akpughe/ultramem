@@ -177,9 +177,9 @@ impl Db for PgDb {
             sqlx::query(
                 "insert into memories \
                  (id, container_tag, kind, statement, confidence, is_latest, needs_review, \
-                  supersedes, superseded_by, extends, event_from, valid_until, learned_at, \
-                  document_id, created_at) \
-                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+                  supersedes, superseded_by, superseded_at, extends, event_from, valid_until, \
+                  learned_at, document_id, created_at) \
+                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) \
                  on conflict (id) do nothing",
             )
             .bind(&m.id)
@@ -191,6 +191,7 @@ impl Db for PgDb {
             .bind(m.needs_review)
             .bind(&m.supersedes)
             .bind(&m.superseded_by)
+            .bind(m.superseded_at)
             .bind(&m.extends)
             .bind(m.event_from)
             .bind(m.valid_until)
@@ -204,14 +205,18 @@ impl Db for PgDb {
         Ok(())
     }
 
-    async fn mark_superseded(&self, pairs: &[(String, String)]) -> Result<(), String> {
+    async fn mark_superseded(&self, pairs: &[(String, String)], ts: i64) -> Result<(), String> {
         for (old_id, new_id) in pairs {
-            sqlx::query("update memories set is_latest = false, superseded_by = $2 where id = $1")
-                .bind(old_id)
-                .bind(new_id)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| format!("mark_superseded failed: {e}"))?;
+            sqlx::query(
+                "update memories set is_latest = false, superseded_by = $2, superseded_at = $3 \
+                 where id = $1",
+            )
+            .bind(old_id)
+            .bind(new_id)
+            .bind(ts)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("mark_superseded failed: {e}"))?;
         }
         Ok(())
     }
@@ -245,7 +250,7 @@ impl Db for PgDb {
     ) -> Result<Vec<MemoryRow>, String> {
         let rows = sqlx::query(
             "select id, container_tag, kind, statement, confidence, is_latest, needs_review, \
-             supersedes, superseded_by, extends, event_from, valid_until, learned_at, \
+             supersedes, superseded_by, superseded_at, extends, event_from, valid_until, learned_at, \
              document_id, created_at \
              from memories \
              where container_tag = $1 and is_latest = true and statement = any($2)",
@@ -267,6 +272,7 @@ impl Db for PgDb {
                 needs_review: r.get("needs_review"),
                 supersedes: r.get("supersedes"),
                 superseded_by: r.get("superseded_by"),
+                superseded_at: r.get("superseded_at"),
                 extends: r.get("extends"),
                 event_from: r.get("event_from"),
                 valid_until: r.get("valid_until"),
@@ -487,7 +493,7 @@ impl Db for PgDb {
     ) -> Result<Vec<MemoryRow>, String> {
         let rows = sqlx::query(
             "select id, container_tag, kind, statement, confidence, is_latest, needs_review, \
-             supersedes, superseded_by, extends, event_from, valid_until, learned_at, \
+             supersedes, superseded_by, superseded_at, extends, event_from, valid_until, learned_at, \
              document_id, created_at \
              from memories where container_tag = $1 limit $2",
         )
@@ -508,6 +514,54 @@ impl Db for PgDb {
                 needs_review: r.get("needs_review"),
                 supersedes: r.get("supersedes"),
                 superseded_by: r.get("superseded_by"),
+                superseded_at: r.get("superseded_at"),
+                extends: r.get("extends"),
+                event_from: r.get("event_from"),
+                valid_until: r.get("valid_until"),
+                learned_at: r.get("learned_at"),
+                document_id: r.get("document_id"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
+    async fn memories_as_of(
+        &self,
+        container_tag: &str,
+        t: i64,
+        cap: i64,
+    ) -> Result<Vec<MemoryRow>, String> {
+        let rows = sqlx::query(
+            "select id, container_tag, kind, statement, confidence, is_latest, needs_review, \
+             supersedes, superseded_by, superseded_at, extends, event_from, valid_until, learned_at, \
+             document_id, created_at \
+             from memories \
+             where container_tag = $1 \
+               and needs_review = false \
+               and learned_at <= $2 \
+               and (superseded_at is null or superseded_at > $2) \
+               and (valid_until is null or valid_until > $2) \
+             order by learned_at desc limit $3",
+        )
+        .bind(container_tag)
+        .bind(t)
+        .bind(cap)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("memories_as_of failed: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| MemoryRow {
+                id: r.get("id"),
+                container_tag: r.get("container_tag"),
+                kind: r.get("kind"),
+                statement: r.get("statement"),
+                confidence: r.get("confidence"),
+                is_latest: r.get("is_latest"),
+                needs_review: r.get("needs_review"),
+                supersedes: r.get("supersedes"),
+                superseded_by: r.get("superseded_by"),
+                superseded_at: r.get("superseded_at"),
                 extends: r.get("extends"),
                 event_from: r.get("event_from"),
                 valid_until: r.get("valid_until"),
@@ -542,7 +596,7 @@ impl Db for PgDb {
     async fn get_memory(&self, id: &str, container_tag: &str) -> Result<Option<MemoryRow>, String> {
         let row = sqlx::query(
             "select id, container_tag, kind, statement, confidence, is_latest, needs_review, \
-             supersedes, superseded_by, extends, event_from, valid_until, learned_at, \
+             supersedes, superseded_by, superseded_at, extends, event_from, valid_until, learned_at, \
              document_id, created_at \
              from memories where id = $1 and container_tag = $2",
         )
@@ -561,6 +615,7 @@ impl Db for PgDb {
             needs_review: r.get("needs_review"),
             supersedes: r.get("supersedes"),
             superseded_by: r.get("superseded_by"),
+            superseded_at: r.get("superseded_at"),
             extends: r.get("extends"),
             event_from: r.get("event_from"),
             valid_until: r.get("valid_until"),
