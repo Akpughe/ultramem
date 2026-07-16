@@ -241,6 +241,15 @@ impl Db for MockDb {
             .cloned()
             .collect())
     }
+    async fn get_memory(&self, id: &str, container_tag: &str) -> Result<Option<MemoryRow>, String> {
+        Ok(self
+            .memories
+            .lock()
+            .unwrap()
+            .get(id)
+            .filter(|m| m.container_tag == container_tag)
+            .cloned())
+    }
     async fn grant_acl(&self, entry: &AclEntry) -> Result<(), String> {
         let mut acls = self.acls.lock().unwrap();
         if !acls.iter().any(|a| {

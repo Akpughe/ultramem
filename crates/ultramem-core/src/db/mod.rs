@@ -200,6 +200,9 @@ pub trait Db: Send + Sync {
         container_tag: &str,
         cap: i64,
     ) -> Result<Vec<MemoryRow>, String>;
+    /// Fetch one memory by id, scoped to its namespace (`None` if absent or in
+    /// another tenant) — the source lookup for promotion.
+    async fn get_memory(&self, id: &str, container_tag: &str) -> Result<Option<MemoryRow>, String>;
     /// Grant a principal a capability on a scope (idempotent).
     async fn grant_acl(&self, entry: &AclEntry) -> Result<(), String>;
     /// Revoke a specific grant (idempotent — an absent grant is a no-op).

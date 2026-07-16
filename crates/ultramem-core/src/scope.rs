@@ -56,6 +56,18 @@ pub fn can_read(principal_own: &str, scope: &str, acls: &[AclEntry]) -> bool {
         .any(|s| s == scope)
 }
 
+/// Whether `principal` may PROMOTE a memory INTO `scope`. Writing into a shared
+/// brain is a higher bar than reading it: only an explicit `promote` or `admin`
+/// grant confers it — `read`/`write` on the scope do NOT. Fail-closed. `acls`
+/// are checked against `principal` so a grant to someone else never applies.
+pub fn can_promote(principal: &str, scope: &str, acls: &[AclEntry]) -> bool {
+    acls.iter().any(|a| {
+        a.principal == principal
+            && a.scope == scope
+            && matches!(a.capability.as_str(), "promote" | "admin")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +115,34 @@ mod tests {
         // scope — only the exact scopes granted are visible.
         let acls = vec![acl("user_1", "company", "read")];
         assert!(!can_read("user_1", "team_secret", &acls));
+    }
+
+    #[test]
+    fn promote_needs_promote_or_admin_grant() {
+        // read/write on the scope do NOT confer promote (write into a shared
+        // brain is a higher bar than reading it).
+        let read_only = vec![acl("user_1", "company", "read")];
+        assert!(!can_promote("user_1", "company", &read_only));
+        let write_only = vec![acl("user_1", "company", "write")];
+        assert!(!can_promote("user_1", "company", &write_only));
+
+        // promote and admin both confer it.
+        assert!(can_promote(
+            "user_1",
+            "company",
+            &[acl("user_1", "company", "promote")]
+        ));
+        assert!(can_promote(
+            "user_1",
+            "company",
+            &[acl("user_1", "company", "admin")]
+        ));
+
+        // A grant for a different principal or scope never applies.
+        let other = vec![acl("someone_else", "company", "promote")];
+        assert!(!can_promote("user_1", "company", &other));
+        let wrong_scope = vec![acl("user_1", "team", "promote")];
+        assert!(!can_promote("user_1", "company", &wrong_scope));
     }
 
     #[test]
