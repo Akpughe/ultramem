@@ -31,6 +31,8 @@ pub struct DocumentRow {
     pub content_hash: Option<String>,
     /// Normalized reference URL (tracking params stripped) — the other dedup key.
     pub canonical_url: Option<String>,
+    /// Object-storage key of the original uploaded file (Task 2b), if any.
+    pub blob_key: Option<String>,
     pub captured_at: i64,
     pub processing_state: String,
     pub created_at: i64,

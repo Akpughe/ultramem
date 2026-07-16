@@ -121,6 +121,9 @@ pub struct EngineCfg {
     /// the only store). Set it to enable the relational source of truth. Scaffold
     /// only for now — the engine does not yet dual-write.
     pub pg_url: Option<String>,
+    /// Object-storage directory for original uploads (Task 2b). Env:
+    /// `ULTRAMEM_BLOB_DIR`. `None` → originals aren't kept.
+    pub blob_dir: Option<String>,
 }
 
 impl Default for EngineCfg {
@@ -153,6 +156,7 @@ impl Default for EngineCfg {
             fetch_web_bodies: false,
             temporal_graph: false,
             pg_url: None,
+            blob_dir: None,
         }
     }
 }
@@ -208,6 +212,9 @@ impl EngineCfg {
                 }
             },
             pg_url: std::env::var("ULTRAMEM_PG_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            blob_dir: std::env::var("ULTRAMEM_BLOB_DIR")
                 .ok()
                 .filter(|s| !s.is_empty()),
             ..Default::default()
@@ -322,6 +329,9 @@ pub struct MemoryEngine {
     /// Phase A relational source of truth. `None` → Qdrant-only (unchanged
     /// behavior); `Some` → the engine dual-writes documents/chunks and dedups.
     db: Option<Arc<dyn crate::db::Db>>,
+    /// Phase A object storage for original uploads (Task 2b). `None` → originals
+    /// aren't kept (unchanged); `Some` → the file bytes are stored on ingest.
+    blob_store: Option<Arc<dyn crate::providers::BlobStore>>,
     cfg: RwLock<EngineCfg>,
     /// Cached standing profile per namespace: tag → (profile, computed_at_unix).
     /// Recompiled lazily when older than `PROFILE_TTL`.
@@ -353,6 +363,7 @@ impl MemoryEngine {
                 cfg.qdrant_api_key.clone(),
             )),
             db: None,
+            blob_store: None,
             cfg: RwLock::new(cfg),
             profile_cache: RwLock::new(HashMap::new()),
         }
@@ -363,6 +374,14 @@ impl MemoryEngine {
     /// The server connects + migrates a `PgDb` at startup and injects it here.
     pub fn with_db(mut self, db: Arc<dyn crate::db::Db>) -> Self {
         self.db = Some(db);
+        self
+    }
+
+    /// Attach object storage for original uploads (Task 2b). When set, an
+    /// ingested file's bytes are kept (keyed by document id) so the document can
+    /// be re-derived or downloaded, and `blob_key` is recorded on the doc row.
+    pub fn with_blob_store(mut self, blob: Arc<dyn crate::providers::BlobStore>) -> Self {
+        self.blob_store = Some(blob);
         self
     }
 
@@ -494,11 +513,20 @@ impl MemoryEngine {
         // no text layer, fall back to Mistral OCR for PDFs (scanned/image) and
         // to local `textutil` for Office docs.
         const MIN_EXTRACT: usize = 24;
+        // Task 2b: preserve the original uploaded bytes in object storage (keyed
+        // by doc id) so the document can be re-derived/downloaded later.
+        let mut blob_key: Option<String> = None;
         let content = match &doc.file_path {
             Some(p) => {
                 let bytes = tokio::fs::read(p)
                     .await
                     .map_err(|e| format!("read {p}: {e}"))?;
+                if let Some(blob) = &self.blob_store {
+                    match blob.put(&doc_id, &bytes).await {
+                        Ok(()) => blob_key = Some(doc_id.clone()),
+                        Err(e) => eprintln!("[ultramem] blob put failed for '{}': {e}", doc.title),
+                    }
+                }
                 let filename = std::path::Path::new(p)
                     .file_name()
                     .map(|f| f.to_string_lossy().into_owned())
@@ -692,6 +720,7 @@ impl MemoryEngine {
                 reference: doc.reference.clone(),
                 content_hash: Some(content_hash.clone()),
                 canonical_url: canonical_url.clone(),
+                blob_key: blob_key.clone(),
                 captured_at: doc.captured_at,
                 processing_state: "chunked".into(),
                 created_at: now,
@@ -1910,6 +1939,7 @@ impl MemoryEngine {
                     reference: pl["reference"].as_str().unwrap_or_default().to_string(),
                     content_hash: None,
                     canonical_url: None,
+                    blob_key: None,
                     captured_at: pl["captured_at"].as_i64().unwrap_or(now),
                     processing_state: "backfilled".into(),
                     created_at: now,
@@ -3288,6 +3318,54 @@ mod tests {
                 .collect();
             assert!(ids.contains(&"ch1".to_string()));
             assert!(ids.contains(&"ch3".to_string()));
+        });
+    }
+
+    /// Phase A Task 2b: an uploaded file's original bytes are stored in the blob
+    /// store (keyed by doc id) and blob_key is recorded on the document row.
+    /// Offline via a mock OCR (so no network) + mock blob store/db.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn original_upload_is_stored_and_keyed() {
+        use crate::db::mock::MockDb;
+        use crate::db::Db;
+        use crate::providers::mock::{MemStore, MockBlobStore, MockEmbedder, MockOcr};
+        use crate::providers::BlobStore;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = EngineCfg::default();
+            cfg.chunks_collection = "c".into();
+            cfg.facts_collection = "f".into();
+            let blob = Arc::new(MockBlobStore::new());
+            let db = Arc::new(MockDb::new());
+            let engine = MemoryEngine::new(cfg)
+                .with_store(Arc::new(MemStore::new()))
+                .with_embedder(Arc::new(MockEmbedder { dim: 8 }))
+                .with_ocr(Arc::new(MockOcr {
+                    text: "some scanned text".into(),
+                }))
+                .with_blob_store(blob.clone())
+                .with_db(db.clone());
+            let path =
+                std::env::temp_dir().join(format!("ultramem-orig-{}.png", std::process::id()));
+            tokio::fs::write(&path, b"PNGBYTES").await.unwrap();
+            let doc = IngestDoc {
+                source: "file".into(),
+                title: "shot".into(),
+                content: "File shot.png".into(),
+                reference: String::new(),
+                app: String::new(),
+                captured_at: 1_000,
+                file_path: Some(path.to_string_lossy().into_owned()),
+                container_tag: "t".into(),
+            };
+            let id = engine.add_document(&doc).await.unwrap();
+            // Original bytes preserved under the doc id...
+            assert_eq!(blob.get(&id).await.unwrap(), b"PNGBYTES");
+            // ...and the document row points at them.
+            let d = db.get_document(&id, "t").await.unwrap().unwrap();
+            assert_eq!(d.blob_key.as_deref(), Some(id.as_str()));
+            let _ = tokio::fs::remove_file(&path).await;
         });
     }
 

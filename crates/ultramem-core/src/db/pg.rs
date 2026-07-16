@@ -45,9 +45,9 @@ impl Db for PgDb {
     async fn insert_document(&self, d: &DocumentRow) -> Result<(), String> {
         sqlx::query(
             "insert into documents \
-             (id, container_tag, source, title, reference, content_hash, canonical_url, \
+             (id, container_tag, source, title, reference, content_hash, canonical_url, blob_key, \
               captured_at, processing_state, created_at) \
-             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) on conflict (id) do nothing",
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) on conflict (id) do nothing",
         )
         .bind(&d.id)
         .bind(&d.container_tag)
@@ -56,6 +56,7 @@ impl Db for PgDb {
         .bind(&d.reference)
         .bind(&d.content_hash)
         .bind(&d.canonical_url)
+        .bind(&d.blob_key)
         .bind(d.captured_at)
         .bind(&d.processing_state)
         .bind(d.created_at)
@@ -111,7 +112,7 @@ impl Db for PgDb {
         limit: i64,
     ) -> Result<Vec<DocumentRow>, String> {
         let rows = sqlx::query(
-            "select id, container_tag, source, title, reference, content_hash, canonical_url, \
+            "select id, container_tag, source, title, reference, content_hash, canonical_url, blob_key, \
              captured_at, processing_state, created_at \
              from documents \
              where container_tag = $1 and ($2::bigint is null or captured_at < $2) \
@@ -133,6 +134,7 @@ impl Db for PgDb {
                 reference: r.get("reference"),
                 content_hash: r.get("content_hash"),
                 canonical_url: r.get("canonical_url"),
+                blob_key: r.get("blob_key"),
                 captured_at: r.get("captured_at"),
                 processing_state: r.get("processing_state"),
                 created_at: r.get("created_at"),
@@ -146,7 +148,7 @@ impl Db for PgDb {
         container_tag: &str,
     ) -> Result<Option<DocumentRow>, String> {
         let row = sqlx::query(
-            "select id, container_tag, source, title, reference, content_hash, canonical_url, \
+            "select id, container_tag, source, title, reference, content_hash, canonical_url, blob_key, \
              captured_at, processing_state, created_at \
              from documents where id = $1 and container_tag = $2",
         )
@@ -163,6 +165,7 @@ impl Db for PgDb {
             reference: r.get("reference"),
             content_hash: r.get("content_hash"),
             canonical_url: r.get("canonical_url"),
+            blob_key: r.get("blob_key"),
             captured_at: r.get("captured_at"),
             processing_state: r.get("processing_state"),
             created_at: r.get("created_at"),
@@ -477,6 +480,7 @@ mod tests {
                 reference: String::new(),
                 content_hash: Some("deadbeef".into()),
                 canonical_url: None,
+                blob_key: None,
                 captured_at: 1,
                 processing_state: "pending".into(),
                 created_at: 1,

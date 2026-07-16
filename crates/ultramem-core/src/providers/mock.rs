@@ -13,8 +13,58 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::{EmbedTask, Embedder, Llm, VectorStore};
+use super::{BlobStore, EmbedTask, Embedder, Llm, Ocr, VectorStore};
 use crate::llm::ResolvedModel;
+
+/// An OCR provider that returns canned text (no network) — `.png` paths route to
+/// it so an offline ingest test never calls Jina/Mistral.
+pub struct MockOcr {
+    pub text: String,
+}
+
+#[async_trait]
+impl Ocr for MockOcr {
+    async fn ocr_pdf(&self, _bytes: &[u8]) -> Result<String, String> {
+        Ok(self.text.clone())
+    }
+    async fn ocr_image(&self, _bytes: &[u8], _mime: &str) -> Result<String, String> {
+        Ok(self.text.clone())
+    }
+    fn image_mime(&self, path: &str) -> Option<&'static str> {
+        path.ends_with(".png").then_some("image/png")
+    }
+}
+
+/// In-memory blob store for offline tests.
+#[derive(Default)]
+pub struct MockBlobStore {
+    blobs: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl MockBlobStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl BlobStore for MockBlobStore {
+    async fn put(&self, key: &str, bytes: &[u8]) -> Result<(), String> {
+        self.blobs
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), bytes.to_vec());
+        Ok(())
+    }
+    async fn get(&self, key: &str) -> Result<Vec<u8>, String> {
+        self.blobs
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .ok_or_else(|| "not found".to_string())
+    }
+}
 
 /// A deterministic embedder that returns fixed-dimension zero vectors — enough
 /// for offline ingest tests that don't exercise similarity.

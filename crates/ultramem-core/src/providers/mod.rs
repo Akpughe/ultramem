@@ -19,6 +19,7 @@ use crate::llm::ResolvedModel;
 use async_trait::async_trait;
 use serde_json::Value;
 
+pub mod blob;
 pub mod jina;
 pub mod llm_provider;
 pub mod mistral;
@@ -27,6 +28,7 @@ pub mod mock;
 pub mod openai;
 pub mod qdrant_store;
 
+pub use blob::{BlobStore, LocalFsBlobStore};
 pub use jina::{JinaEmbedder, JinaReranker};
 pub use mistral::MistralOcr;
 pub use openai::OpenAiEmbedder;

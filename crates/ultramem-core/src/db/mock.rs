@@ -255,6 +255,7 @@ mod tests {
             reference: String::new(),
             content_hash: Some(format!("hash-of-{id}")),
             canonical_url: None,
+            blob_key: None,
             captured_at: 1,
             processing_state: "pending".into(),
             created_at: 1,
