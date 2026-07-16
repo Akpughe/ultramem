@@ -5,6 +5,41 @@ entry records what changed, what was verified, and what the next sprint is.
 
 ---
 
+## 8/10 scopes — company-brain multi-scope (IN PROGRESS)
+
+Fail-closed access model: a "scope" is a `container_tag`; a principal sees its own
+scope plus scopes it has been **explicitly** granted read (or higher) on. No
+implicit inheritance. Every deployment without ACL grants behaves byte-for-byte
+as before — access only ever *expands* via an explicit `grant_acl`.
+
+- **8a — ACL model + resolver** (PR #18, `d88ebd0`) — `acl_entries` table
+  (`0002_acl.sql`), `AclEntry` + `grant_acl`/`acls_for_principal` on the `Db` trait
+  (PG + Mock impls), and the pure `scope::visible_scopes` resolver (own-first,
+  deduped, read/write/promote/admin grant read; unknown capability does not; 5
+  exhaustive tests).
+- **8b — enforce in retrieval** (branch `scopes-8b-enforce`) — the read path now
+  spans the principal's visible scopes. `MemoryEngine::visible_scopes_for(tag)`
+  = own + granted (fail-closed: no Db / DB error / no grants → `[tag]`). New pure
+  `scope_filter(base, scopes)`: a single scope is *exactly* `tagged_filter` (the
+  default everywhere), several scopes match `container_tag` ∈ scopes via a
+  `should`/OR while base source/time stay `must`. Wired into
+  `retrieve_for_plan_tagged` (main filter + fallback retry only; writes, reconcile,
+  delete, backfill and graph paths stay strictly single-scope). Leak test asserts
+  the property against the same evaluator reads use: a principal granted `team`
+  sees own + `team` but never an ungranted `hr`, and superseded facts stay excluded
+  inside a granted scope. `filter_matches` exposed `pub(crate)` for the assertion.
+
+### Verified (this machine)
+`cargo fmt --check`, `clippy --all-targets -D warnings`, `cargo test --workspace
+--all-targets` (127 core + 12 server) + `--doc` all green. 3 new 8b tests.
+
+### Next (remaining 8/10)
+Promotion flow (private→shared via `promote` capability), memory
+review/edit/pin/reject/forget/export endpoints, per-scope profile entries — then
+9/10 (temporal graph on in prod, entity resolution, bitemporal `as_of`).
+
+---
+
 ## Sprint 1C — evaluation & reproducibility (COMPLETE)
 
 **Result: PASS — 5 of 5 items done** · branch `sprint-1c-eval` (from `main`) · date 2026-07-07

@@ -1440,6 +1440,21 @@ impl MemoryEngine {
             .collect()
     }
 
+    /// The scopes a principal may *read* from: its own namespace, plus any scope
+    /// it has been explicitly granted read (or higher) on. Own scope is always
+    /// first. With no relational store attached, or no ACL grants — the case for
+    /// every deployment by default — this is exactly `[tag]`, so the retrieval
+    /// filter is unchanged and access only ever *expands* through an explicit
+    /// `grant_acl`. Fail-closed: a DB error degrades to own-scope-only, never to
+    /// a wider view.
+    pub async fn visible_scopes_for(&self, tag: &str) -> Vec<String> {
+        let Some(db) = &self.db else {
+            return vec![tag.to_string()];
+        };
+        let acls = db.acls_for_principal(tag).await.unwrap_or_default();
+        crate::scope::visible_scopes(tag, &acls)
+    }
+
     /// Whether a relational source of truth is attached (jobs/provenance require it).
     pub fn has_db(&self) -> bool {
         self.db.is_some()
@@ -1596,7 +1611,10 @@ impl MemoryEngine {
         // only fires when there were source/time constraints to relax.
         let plan_filter = build_filter(plan);
         let had_plan_constraints = plan_filter.is_some();
-        let filter = Some(tagged_filter(plan_filter, tag));
+        // Reads span the principal's visible scopes (own + explicitly granted).
+        // No grants (the default everywhere) → `[tag]` → identical to before.
+        let scopes = self.visible_scopes_for(tag).await;
+        let filter = Some(scope_filter(plan_filter, &scopes));
         let doc_limit = if plan.listy { limit.max(20) } else { limit };
         // Recall wide: multi-chunk documents would otherwise crowd distinct
         // files out of the candidate pool before the reranker ever sees them.
@@ -1703,7 +1721,7 @@ impl MemoryEngine {
                     &embed_text,
                     hit_limit,
                     FALLBACK_THRESHOLD,
-                    Some(tagged_filter(None, tag)),
+                    Some(scope_filter(None, &scopes)),
                 )
                 .await?;
         }
@@ -2306,6 +2324,38 @@ fn tagged_filter(base: Option<Value>, tag: &str) -> Value {
         }
     }
     f
+}
+
+/// Read-path namespace filter spanning a principal's *visible* scopes (its own
+/// scope plus any it has been explicitly granted read on — see [`crate::scope`]).
+///
+/// With a single scope this is exactly [`tagged_filter`] — the case for every
+/// deployment without ACL grants, so retrieval behavior is byte-for-byte
+/// unchanged and access only ever *expands* when an admin grants it. With
+/// several scopes it matches points whose `container_tag` is ANY of them (a
+/// `should`/OR), while the base source/time constraints stay `must` (AND). The
+/// default tag among the scopes also matches legacy (untagged) points, exactly
+/// as single-scope reads do. Fail-closed: `scopes` is the resolver's output,
+/// which always begins with the principal's own scope.
+fn scope_filter(base: Option<Value>, scopes: &[String]) -> Value {
+    match scopes {
+        [] => tagged_filter(base, DEFAULT_TAG),
+        [one] => tagged_filter(base, one),
+        many => {
+            let mut f = base.unwrap_or_else(|| json!({}));
+            let obj = f.as_object_mut().expect("filter is an object");
+            let should = obj.entry("should").or_insert_with(|| json!([]));
+            if let Some(a) = should.as_array_mut() {
+                for s in many {
+                    a.push(json!({ "key": "container_tag", "match": { "value": s } }));
+                    if s == DEFAULT_TAG {
+                        a.push(json!({ "is_empty": { "key": "container_tag" } }));
+                    }
+                }
+            }
+            f
+        }
+    }
 }
 
 /// Filter that matches exactly one document's points *within a namespace*: the
@@ -3651,6 +3701,151 @@ mod pipeline_tests {
 
             let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.chunks_collection).await;
             let _ = qdrant::delete_collection(&http, &cfg.qdrant_url, &cfg.qdrant_api_key, &cfg.facts_collection).await;
+        });
+    }
+
+    /// 8/10 slice 8b — the read-path scope filter. A single scope must produce
+    /// exactly the legacy `tagged_filter` (so every deployment without ACL grants
+    /// is byte-for-byte unchanged), including the default tag's legacy-point OR.
+    #[test]
+    fn scope_filter_single_scope_is_unchanged() {
+        // Explicit tag: identical to tagged_filter.
+        assert_eq!(
+            scope_filter(None, &["alice".to_string()]),
+            tagged_filter(None, "alice")
+        );
+        // Default tag: still matches legacy (untagged) points via the should/OR.
+        assert_eq!(
+            scope_filter(None, &[DEFAULT_TAG.to_string()]),
+            tagged_filter(None, DEFAULT_TAG)
+        );
+        // Empty scopes degrades to the default namespace, never a wildcard.
+        assert_eq!(scope_filter(None, &[]), tagged_filter(None, DEFAULT_TAG));
+        // A source/time base is preserved as a `must` alongside the tag.
+        let base = json!({ "must": [{ "key": "source", "match": { "value": "slack" } }] });
+        assert_eq!(
+            scope_filter(Some(base.clone()), &["alice".to_string()]),
+            tagged_filter(Some(base), "alice")
+        );
+    }
+
+    /// 8b leak test — the security property, asserted against the SAME filter
+    /// evaluator reads rely on. A principal granted read on `team` sees points in
+    /// its own scope AND `team`, but NEVER an ungranted scope (`hr`). Superseded
+    /// facts stay excluded even inside a granted scope.
+    #[test]
+    fn scope_filter_multi_scope_never_leaks_ungranted() {
+        use crate::providers::mock::filter_matches;
+        let p = |tag: &str| json!({ "container_tag": tag });
+
+        // Own scope only ("alice"): the classic single-tenant isolation.
+        let own = scope_filter(None, &["alice".to_string()]);
+        assert!(filter_matches(&p("alice"), &own));
+        assert!(
+            !filter_matches(&p("team"), &own),
+            "LEAK: saw team without a grant"
+        );
+        assert!(!filter_matches(&p("hr"), &own));
+
+        // Granted read on "team": own + team visible, hr still invisible.
+        let granted = scope_filter(None, &["alice".to_string(), "team".to_string()]);
+        assert!(
+            filter_matches(&p("alice"), &granted),
+            "own scope must stay visible"
+        );
+        assert!(
+            filter_matches(&p("team"), &granted),
+            "granted scope must be visible"
+        );
+        assert!(
+            !filter_matches(&p("hr"), &granted),
+            "LEAK: an ungranted scope was visible"
+        );
+
+        // Source/time constraints still apply on top of the multi-scope OR.
+        let base = json!({ "must": [{ "key": "source", "match": { "value": "slack" } }] });
+        let scoped = scope_filter(Some(base), &["alice".to_string(), "team".to_string()]);
+        let team_slack = json!({ "container_tag": "team", "source": "slack" });
+        let team_email = json!({ "container_tag": "team", "source": "email" });
+        assert!(filter_matches(&team_slack, &scoped));
+        assert!(
+            !filter_matches(&team_email, &scoped),
+            "base must-constraint dropped"
+        );
+
+        // A superseded fact inside a granted scope is still excluded by the
+        // active-facts wrapper composed over the multi-scope filter.
+        let active = active_facts_filter(
+            Some(scope_filter(
+                None,
+                &["alice".to_string(), "team".to_string()],
+            )),
+            1_000,
+        );
+        let live = json!({ "container_tag": "team" });
+        let dead = json!({ "container_tag": "team", "is_latest": false });
+        assert!(filter_matches(&live, &active));
+        assert!(
+            !filter_matches(&dead, &active),
+            "superseded fact leaked in a granted scope"
+        );
+    }
+
+    /// 8b — the resolver that feeds the filter. Visibility expands ONLY through an
+    /// explicit grant; own scope is always present and first; an ungranted scope
+    /// never appears; and with no Db attached it is own-scope-only (fail-closed).
+    #[test]
+    fn visible_scopes_for_expands_only_via_grant() {
+        use crate::db::mock::MockDb;
+        use crate::db::{AclEntry, Db};
+        use crate::providers::mock::MemStore;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = Arc::new(MockDb::new());
+            let engine = MemoryEngine::new(EngineCfg::default())
+                .with_store(Arc::new(MemStore::new()))
+                .with_db(db.clone());
+
+            // No grants → own scope only (unchanged behavior).
+            assert_eq!(
+                engine.visible_scopes_for("alice").await,
+                vec!["alice".to_string()]
+            );
+
+            let grant = |p: &str, s: &str, c: &str| AclEntry {
+                principal: p.into(),
+                scope: s.into(),
+                capability: c.into(),
+                created_at: 0,
+            };
+            db.grant_acl(&grant("alice", "team", "read")).await.unwrap();
+            // A write grant also confers read (write ⊇ read).
+            db.grant_acl(&grant("alice", "proj", "write"))
+                .await
+                .unwrap();
+            // A grant for a DIFFERENT principal must not widen alice's view.
+            db.grant_acl(&grant("bob", "hr", "read")).await.unwrap();
+
+            let scopes = engine.visible_scopes_for("alice").await;
+            assert_eq!(
+                scopes.first(),
+                Some(&"alice".to_string()),
+                "own scope must be first"
+            );
+            assert!(scopes.contains(&"team".to_string()));
+            assert!(scopes.contains(&"proj".to_string()));
+            assert!(
+                !scopes.contains(&"hr".to_string()),
+                "LEAK: another principal's grant widened the view"
+            );
+
+            // Fail-closed: no relational store → own scope only, never wider.
+            let bare =
+                MemoryEngine::new(EngineCfg::default()).with_store(Arc::new(MemStore::new()));
+            assert_eq!(
+                bare.visible_scopes_for("alice").await,
+                vec!["alice".to_string()]
+            );
         });
     }
 }
