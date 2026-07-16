@@ -63,6 +63,9 @@ pub struct MemoryRow {
     pub needs_review: bool,
     pub supersedes: Option<String>,
     pub superseded_by: Option<String>,
+    /// Transaction time the memory stopped being current (was superseded), if it
+    /// has been. `None` = still the latest we know. Powers bitemporal `as_of`.
+    pub superseded_at: Option<i64>,
     pub extends: Option<String>,
     pub event_from: Option<i64>,
     pub valid_until: Option<i64>,
@@ -161,8 +164,9 @@ pub trait Db: Send + Sync {
     /// Insert distilled memory rows (idempotent by id).
     async fn insert_memories(&self, memories: &[MemoryRow]) -> Result<(), String>;
     /// Mirror a supersession: for each `(old_id, new_id)`, mark the old memory
-    /// `is_latest = false` and record `superseded_by = new_id`.
-    async fn mark_superseded(&self, pairs: &[(String, String)]) -> Result<(), String>;
+    /// `is_latest = false`, record `superseded_by = new_id`, and stamp
+    /// `superseded_at = ts` (the transaction time, for bitemporal `as_of`).
+    async fn mark_superseded(&self, pairs: &[(String, String)], ts: i64) -> Result<(), String>;
     /// Insert memory-evidence rows (idempotent by id).
     async fn insert_evidence(&self, rows: &[EvidenceRow]) -> Result<(), String>;
     /// Fetch the current (is_latest) memory rows in `container_tag` whose
@@ -198,6 +202,17 @@ pub trait Db: Send + Sync {
     async fn memories_for_tag(
         &self,
         container_tag: &str,
+        cap: i64,
+    ) -> Result<Vec<MemoryRow>, String>;
+    /// Bitemporal point-in-time read: the memories that were **current knowledge**
+    /// as of transaction time `t` — learned at/before `t`, not yet superseded as of
+    /// `t` (`superseded_at` is null or `> t`), still valid in the world at `t`
+    /// (`valid_until` is null or `> t`), and not quarantined. Reconstructs "what we
+    /// knew as of `t`", not just the present.
+    async fn memories_as_of(
+        &self,
+        container_tag: &str,
+        t: i64,
         cap: i64,
     ) -> Result<Vec<MemoryRow>, String>;
     /// Fetch one memory by id, scoped to its namespace (`None` if absent or in
