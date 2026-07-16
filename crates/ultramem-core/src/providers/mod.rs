@@ -155,5 +155,8 @@ pub trait VectorStore: Send + Sync {
     ) -> Result<Vec<(i64, String)>, String>;
     async fn delete_by_filter(&self, collection: &str, filter: Value) -> Result<(), String>;
     async fn delete_by_doc(&self, collection: &str, doc_id: &str) -> Result<(), String>;
+    /// Delete points by exact id (fact-granular forget). The caller MUST verify
+    /// ownership first — an id delete carries no namespace constraint.
+    async fn delete_by_ids(&self, collection: &str, ids: &[String]) -> Result<(), String>;
     async fn delete_collection(&self, name: &str) -> Result<(), String>;
 }

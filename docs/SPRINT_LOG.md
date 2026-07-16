@@ -48,16 +48,26 @@ as before — access only ever *expands* via an explicit `grant_acl`.
   confer it — `read`/`write` do **not**), engine `promote_memory` + `can_promote`,
   and the endpoint (fail-closed authz + `404` for a non-owned source). Audited.
 
+- **8e — fact-granular forget (right-to-erasure)** (branch `scopes-8e-forget`) —
+  `DELETE /v1/facts/:id` hard-removes a single distilled memory (and its evidence)
+  from **both** the vector index and the relational source of truth, scoped to the
+  caller's namespace (a wrong-tenant id is a `404` no-op — never a cross-tenant
+  erasure). Adds a `delete_by_ids` vector-store primitive (Qdrant `points/delete` by
+  id + MemStore), `Db::delete_memory` (scoped, cascades evidence; PG + Mock), and
+  engine `forget_memory` (read-gate ownership check → erase vector *before* the
+  relational row, so a rebuild can't resurrect it and a partial failure is
+  retry-safe). Audited. Documented in `docs/API.md`.
+
 ### Verified (this machine)
 `cargo fmt --check`, `clippy --all-targets -D warnings`, `cargo test --workspace
---all-targets` (131 core + 13 server) + `--doc` all green. 8b–8d added 9 tests
-(scope-filter no-op + leak, resolver, ACL round-trip, revoke/by-scope, admin-authz,
-promote-capability, promote round-trip with provenance).
+--all-targets` (132 core + 13 server) + `--doc` all green. 8b–8e added 11 tests
+(scope-filter no-op + leak, resolver, ACL round-trip/revoke/admin-authz, promote
+capability + provenance round-trip, forget total-erasure + cross-tenant no-op).
 
-### Next (remaining 8/10)
-Memory review/edit/pin/reject/forget endpoints (per-memory lifecycle beyond
-document-level delete), per-scope profile entries — then 9/10 (temporal graph on in
-prod, entity resolution, bitemporal `as_of` queries).
+### Next (remaining 8/10 → 9/10)
+Per-scope profile entries (the standing profile should be scope-aware), then the 9/10
+temporal tier: temporal graph on in prod, entity resolution/aliases, bitemporal
+`as_of` queries, background re-linking.
 
 ---
 

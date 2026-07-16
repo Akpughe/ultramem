@@ -518,6 +518,27 @@ impl Db for PgDb {
             .collect())
     }
 
+    async fn delete_memory(&self, id: &str, container_tag: &str) -> Result<bool, String> {
+        // Evidence first (it references the memory); scoped via an EXISTS on the
+        // namespace so a wrong-tenant id can't cascade another tenant's rows.
+        sqlx::query(
+            "delete from memory_evidence where memory_id = $1 \
+             and exists (select 1 from memories m where m.id = $1 and m.container_tag = $2)",
+        )
+        .bind(id)
+        .bind(container_tag)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("delete_memory (evidence) failed: {e}"))?;
+        let res = sqlx::query("delete from memories where id = $1 and container_tag = $2")
+            .bind(id)
+            .bind(container_tag)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("delete_memory failed: {e}"))?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn get_memory(&self, id: &str, container_tag: &str) -> Result<Option<MemoryRow>, String> {
         let row = sqlx::query(
             "select id, container_tag, kind, statement, confidence, is_latest, needs_review, \
