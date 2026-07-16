@@ -3,6 +3,12 @@
 Rolling handoff for the disciplined execution loop. Newest sprint on top. Each
 entry records what changed, what was verified, and what the next sprint is.
 
+> **Definition of done:** [`ACCEPTANCE.md`](ACCEPTANCE.md) is the 10/10 rubric —
+> every hard security gate (§A) and correctness/temporal gate (§B) is **enforced
+> offline and green**; the remaining distance is §C, the **live** LongMemEval
+> accuracy band + at-scale adversarial suites, which is an operator run (a real
+> Qdrant + providers), not further offline code.
+
 ---
 
 ## 9/10 temporal — bitemporal correctness (IN PROGRESS)
