@@ -201,7 +201,9 @@ fn cond_matches(payload: &Value, cond: &Value) -> bool {
 }
 
 /// Evaluate a Qdrant-shaped `{ must, should, must_not }` filter against a payload.
-fn filter_matches(payload: &Value, filter: &Value) -> bool {
+/// `pub(crate)` so filter-construction logic elsewhere (e.g. the scope resolver)
+/// can be asserted against the same semantics reads rely on.
+pub(crate) fn filter_matches(payload: &Value, filter: &Value) -> bool {
     if let Some(must) = filter.get("must").and_then(Value::as_array) {
         if !must.iter().all(|c| cond_matches(payload, c)) {
             return false;
