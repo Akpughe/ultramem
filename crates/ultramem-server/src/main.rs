@@ -503,6 +503,13 @@ async fn reindex(
     };
     state.engine.audit(&tag, "reindex", None).await;
     match b.mode.as_deref().unwrap_or("latest") {
+        // Phase A: migrate this namespace's existing Qdrant data into Postgres.
+        "backfill" => match state.engine.backfill_to_pg(&tag).await {
+            Ok(stats) => {
+                Json(json!({ "ok": true, "mode": "backfill", "stats": stats })).into_response()
+            }
+            Err(e) => err(e),
+        },
         "tags" => match state.engine.claim_legacy_into_tag(&tag).await {
             Ok(()) => {
                 let _ = state.engine.backfill_facts_latest().await;
