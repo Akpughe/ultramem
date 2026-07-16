@@ -295,6 +295,14 @@ pub struct EvidenceItem {
     pub chunk_id: Option<String>,
 }
 
+/// What a backfill migrated from Qdrant into Postgres (Phase A Task 7).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackfillStats {
+    pub documents: usize,
+    pub chunks: usize,
+    pub memories: usize,
+}
+
 pub struct MemoryEngine {
     /// Kept only for Jina **Reader** file/URL extraction (`extract.rs`) — text
     /// extraction, distinct from the embedder/OCR providers.
@@ -1858,6 +1866,108 @@ impl MemoryEngine {
             .join("\n\n"))
     }
 
+    /// Backfill the relational source of truth from existing Qdrant data
+    /// (Phase A Task 7): reconstruct `documents` + `chunks` from the chunks
+    /// collection and `memories` from the facts collection, for one namespace.
+    /// Idempotent (all inserts are `on conflict do nothing`), so it's safe to
+    /// re-run. Evidence rows aren't backfilled — they need a re-distill.
+    pub async fn backfill_to_pg(&self, tag: &str) -> Result<BackfillStats, String> {
+        let Some(db) = &self.db else {
+            return Err(
+                "backfill requires a Postgres source of truth (set ULTRAMEM_PG_URL)".into(),
+            );
+        };
+        let cfg = self.cfg();
+        let now = chrono::Utc::now().timestamp();
+        const CAP: usize = 200_000;
+
+        // Chunks → documents (deduped by doc_id) + chunk rows.
+        let chunk_pts = self
+            .store
+            .scroll_all(&cfg.chunks_collection, Some(tagged_filter(None, tag)), CAP)
+            .await?;
+        let mut docs: std::collections::HashMap<String, crate::db::DocumentRow> =
+            std::collections::HashMap::new();
+        let mut chunk_rows: Vec<crate::db::ChunkRow> = Vec::new();
+        for p in &chunk_pts {
+            let pl = &p["payload"];
+            let (Some(doc_id), Some(point_id)) = (pl["doc_id"].as_str(), p["id"].as_str()) else {
+                continue;
+            };
+            docs.entry(doc_id.to_string())
+                .or_insert_with(|| crate::db::DocumentRow {
+                    id: doc_id.to_string(),
+                    container_tag: pl["container_tag"].as_str().unwrap_or(tag).to_string(),
+                    source: pl["source"].as_str().unwrap_or_default().to_string(),
+                    title: pl["title"].as_str().unwrap_or_default().to_string(),
+                    reference: pl["reference"].as_str().unwrap_or_default().to_string(),
+                    content_hash: None,
+                    canonical_url: None,
+                    captured_at: pl["captured_at"].as_i64().unwrap_or(now),
+                    processing_state: "backfilled".into(),
+                    created_at: now,
+                });
+            chunk_rows.push(crate::db::ChunkRow {
+                id: point_id.to_string(),
+                document_id: doc_id.to_string(),
+                chunk_index: pl["chunk_index"].as_i64().unwrap_or(0) as i32,
+                content: pl["content"].as_str().unwrap_or_default().to_string(),
+                embed_model: self.embedder.id().to_string(),
+                dim: self.embedder.dim() as i32,
+            });
+        }
+
+        // Facts → memory rows.
+        let fact_pts = self
+            .store
+            .scroll_all(&cfg.facts_collection, Some(tagged_filter(None, tag)), CAP)
+            .await?;
+        let mut mem_rows: Vec<crate::db::MemoryRow> = Vec::new();
+        for p in &fact_pts {
+            let pl = &p["payload"];
+            let (Some(point_id), Some(statement), Some(doc_id)) =
+                (p["id"].as_str(), pl["fact"].as_str(), pl["doc_id"].as_str())
+            else {
+                continue;
+            };
+            // Legacy points used the constant kind "fact"; treat that as unknown.
+            let kind = match pl["kind"].as_str() {
+                Some(k) if k != "fact" => k.to_string(),
+                _ => "unknown".into(),
+            };
+            mem_rows.push(crate::db::MemoryRow {
+                id: point_id.to_string(),
+                container_tag: pl["container_tag"].as_str().unwrap_or(tag).to_string(),
+                kind,
+                statement: statement.to_string(),
+                confidence: None,
+                is_latest: pl["is_latest"].as_bool().unwrap_or(true),
+                needs_review: pl["needs_review"].as_bool().unwrap_or(false),
+                supersedes: pl["supersedes"].as_str().map(String::from),
+                superseded_by: None,
+                extends: pl["extends"].as_str().map(String::from),
+                event_from: None,
+                valid_until: pl["valid_until"].as_i64(),
+                learned_at: pl["captured_at"].as_i64().unwrap_or(now),
+                document_id: doc_id.to_string(),
+                created_at: now,
+            });
+        }
+
+        // Documents first (chunks/memories FK them), then the rest.
+        let doc_rows: Vec<_> = docs.into_values().collect();
+        for d in &doc_rows {
+            db.insert_document(d).await?;
+        }
+        db.upsert_chunks(&chunk_rows).await?;
+        db.insert_memories(&mem_rows).await?;
+        Ok(BackfillStats {
+            documents: doc_rows.len(),
+            chunks: chunk_rows.len(),
+            memories: mem_rows.len(),
+        })
+    }
+
     /// One row per distinct document in a namespace: `(doc_id, title, source,
     /// reference, captured_at)`. Built by scrolling the chunks collection and
     /// deduping by `doc_id`. This is UltraMem's document registry — it has no
@@ -2960,6 +3070,69 @@ mod tests {
             let bare =
                 MemoryEngine::new(EngineCfg::default()).with_store(Arc::new(MemStore::new()));
             bare.audit("t", "ingest", None).await;
+        });
+    }
+
+    /// Phase A Task 7: backfill reconstructs documents/chunks/memories in
+    /// Postgres from existing Qdrant data, scoped to the namespace, idempotently.
+    /// The parity check: PG counts match the Qdrant point counts. Offline.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn backfill_migrates_qdrant_into_pg_with_parity() {
+        use crate::db::mock::MockDb;
+        use crate::db::Db;
+        use crate::providers::mock::{MemStore, MockEmbedder};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = EngineCfg::default();
+            cfg.chunks_collection = "c".into();
+            cfg.facts_collection = "f".into();
+            let store = Arc::new(MemStore::new());
+            let db = Arc::new(MockDb::new());
+            let engine = MemoryEngine::new(cfg)
+                .with_store(store.clone())
+                .with_embedder(Arc::new(MockEmbedder { dim: 8 }))
+                .with_db(db.clone());
+            // 2 docs / 3 chunks in tag "t", plus a chunk in another tenant.
+            store
+                .upsert(
+                    "c",
+                    vec![
+                        json!({"id":"ch1","vector":[0.0],"payload":{"doc_id":"d1","chunk_index":0,"content":"alpha","title":"D1","source":"api","reference":"","captured_at":1000,"container_tag":"t"}}),
+                        json!({"id":"ch2","vector":[0.0],"payload":{"doc_id":"d1","chunk_index":1,"content":"beta","title":"D1","source":"api","reference":"","captured_at":1000,"container_tag":"t"}}),
+                        json!({"id":"ch3","vector":[0.0],"payload":{"doc_id":"d2","chunk_index":0,"content":"gamma","title":"D2","source":"api","reference":"","captured_at":2000,"container_tag":"t"}}),
+                        json!({"id":"ch4","vector":[0.0],"payload":{"doc_id":"d3","chunk_index":0,"content":"other","title":"D3","source":"api","container_tag":"other"}}),
+                    ],
+                )
+                .await
+                .unwrap();
+            store
+                .upsert(
+                    "f",
+                    vec![
+                        json!({"id":"m1","vector":[0.0],"payload":{"doc_id":"d1","fact":"the user likes X","kind":"preference","is_latest":true,"container_tag":"t","captured_at":1000}}),
+                        json!({"id":"m2","vector":[0.0],"payload":{"doc_id":"d2","fact":"the user likes Y","kind":"fact","is_latest":true,"container_tag":"t","captured_at":2000}}),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            let stats = engine.backfill_to_pg("t").await.unwrap();
+            assert_eq!((stats.documents, stats.chunks, stats.memories), (2, 3, 2));
+            // Parity: PG counts equal the migrated Qdrant points.
+            assert_eq!(db.document_count(), 2);
+            assert_eq!(db.chunk_count(), 3);
+            assert_eq!(db.memory_count(), 2);
+            // Real kind preserved; the legacy "fact" constant normalizes to unknown.
+            let kinds: Vec<String> = db.memories().into_iter().map(|m| m.kind).collect();
+            assert!(kinds.contains(&"preference".to_string()));
+            assert!(kinds.contains(&"unknown".to_string()));
+            // Idempotent re-run — no duplicates.
+            let again = engine.backfill_to_pg("t").await.unwrap();
+            assert_eq!(again.documents, 2);
+            assert_eq!(db.document_count(), 2);
+            // Other tenant's doc was not migrated into "t".
+            assert!(db.get_document("d3", "t").await.unwrap().is_none());
         });
     }
 
