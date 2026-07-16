@@ -213,6 +213,33 @@ impl Db for MockDb {
             .filter(|e| e.container_tag.as_deref() == Some(container_tag))
             .count() as i64)
     }
+    async fn chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRow>, String> {
+        let mut rows: Vec<ChunkRow> = self
+            .chunks
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|c| c.document_id == document_id)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|c| c.chunk_index);
+        Ok(rows)
+    }
+    async fn memories_for_tag(
+        &self,
+        container_tag: &str,
+        cap: i64,
+    ) -> Result<Vec<MemoryRow>, String> {
+        Ok(self
+            .memories
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|m| m.container_tag == container_tag)
+            .take(cap.max(0) as usize)
+            .cloned()
+            .collect())
+    }
 }
 
 #[cfg(test)]

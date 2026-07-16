@@ -388,6 +388,66 @@ impl Db for PgDb {
             .map_err(|e| format!("audit_count failed: {e}"))?;
         Ok(row.get::<i64, _>("n"))
     }
+
+    async fn chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRow>, String> {
+        let rows = sqlx::query(
+            "select id, document_id, chunk_index, content, embed_model, dim \
+             from chunks where document_id = $1 order by chunk_index",
+        )
+        .bind(document_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("chunks_for_document failed: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ChunkRow {
+                id: r.get("id"),
+                document_id: r.get("document_id"),
+                chunk_index: r.get("chunk_index"),
+                content: r.get("content"),
+                embed_model: r.get("embed_model"),
+                dim: r.get("dim"),
+            })
+            .collect())
+    }
+
+    async fn memories_for_tag(
+        &self,
+        container_tag: &str,
+        cap: i64,
+    ) -> Result<Vec<MemoryRow>, String> {
+        let rows = sqlx::query(
+            "select id, container_tag, kind, statement, confidence, is_latest, needs_review, \
+             supersedes, superseded_by, extends, event_from, valid_until, learned_at, \
+             document_id, created_at \
+             from memories where container_tag = $1 limit $2",
+        )
+        .bind(container_tag)
+        .bind(cap)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("memories_for_tag failed: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| MemoryRow {
+                id: r.get("id"),
+                container_tag: r.get("container_tag"),
+                kind: r.get("kind"),
+                statement: r.get("statement"),
+                confidence: r.get("confidence"),
+                is_latest: r.get("is_latest"),
+                needs_review: r.get("needs_review"),
+                supersedes: r.get("supersedes"),
+                superseded_by: r.get("superseded_by"),
+                extends: r.get("extends"),
+                event_from: r.get("event_from"),
+                valid_until: r.get("valid_until"),
+                learned_at: r.get("learned_at"),
+                document_id: r.get("document_id"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]

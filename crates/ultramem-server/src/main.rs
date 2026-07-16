@@ -510,6 +510,13 @@ async fn reindex(
             }
             Err(e) => err(e),
         },
+        // Phase A: rebuild this namespace's Qdrant index from Postgres.
+        "rebuild" => match state.engine.rebuild_index_from_pg(&tag).await {
+            Ok(stats) => {
+                Json(json!({ "ok": true, "mode": "rebuild", "stats": stats })).into_response()
+            }
+            Err(e) => err(e),
+        },
         "tags" => match state.engine.claim_legacy_into_tag(&tag).await {
             Ok(()) => {
                 let _ = state.engine.backfill_facts_latest().await;

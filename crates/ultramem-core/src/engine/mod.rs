@@ -303,6 +303,13 @@ pub struct BackfillStats {
     pub memories: usize,
 }
 
+/// What a rebuild regenerated in Qdrant from Postgres (Phase A Task 8).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RebuildStats {
+    pub chunks: usize,
+    pub memories: usize,
+}
+
 pub struct MemoryEngine {
     /// Kept only for Jina **Reader** file/URL extraction (`extract.rs`) — text
     /// extraction, distinct from the embedder/OCR providers.
@@ -1968,6 +1975,89 @@ impl MemoryEngine {
         })
     }
 
+    /// Rebuild the Qdrant vector index for a namespace FROM Postgres (Phase A
+    /// Task 8): re-embed each stored chunk + memory and upsert it back, so the
+    /// index is a derived artifact — losing Qdrant is recoverable, not data loss.
+    /// Ids are preserved, so this also repairs drift. Requires a Db.
+    pub async fn rebuild_index_from_pg(&self, tag: &str) -> Result<RebuildStats, String> {
+        let Some(db) = &self.db else {
+            return Err("rebuild requires a Postgres source of truth (set ULTRAMEM_PG_URL)".into());
+        };
+        let cfg = self.cfg();
+        const CAP: i64 = 200_000;
+
+        // Chunks: re-embed each document's chunks (title-prefixed, like ingest).
+        let docs = db.list_documents(tag, None, CAP).await?;
+        let mut chunk_points: Vec<Value> = Vec::new();
+        for d in &docs {
+            let chunks = db.chunks_for_document(&d.id).await?;
+            if chunks.is_empty() {
+                continue;
+            }
+            let inputs: Vec<String> = chunks
+                .iter()
+                .map(|c| embed_input(&d.title, None, &c.content))
+                .collect();
+            let vectors = self.embedder.embed(EmbedTask::Passage, &inputs).await?;
+            for (c, v) in chunks.iter().zip(vectors.iter()) {
+                chunk_points.push(json!({
+                    "id": c.id,
+                    "vector": v,
+                    "payload": {
+                        "doc_id": d.id,
+                        "chunk_index": c.chunk_index,
+                        "content": c.content,
+                        "title": d.title,
+                        "source": d.source,
+                        "reference": d.reference,
+                        "app": "",
+                        "captured_at": d.captured_at,
+                        "container_tag": tag,
+                    },
+                }));
+            }
+        }
+        let n_chunks = chunk_points.len();
+        if !chunk_points.is_empty() {
+            self.store
+                .upsert(&cfg.chunks_collection, chunk_points)
+                .await?;
+        }
+
+        // Memories: re-embed statements, restore lifecycle metadata.
+        let mems = db.memories_for_tag(tag, CAP).await?;
+        let mut fact_points: Vec<Value> = Vec::new();
+        if !mems.is_empty() {
+            let inputs: Vec<String> = mems.iter().map(|m| m.statement.clone()).collect();
+            let vectors = self.embedder.embed(EmbedTask::Passage, &inputs).await?;
+            for (m, v) in mems.iter().zip(vectors.iter()) {
+                fact_points.push(json!({
+                    "id": m.id,
+                    "vector": v,
+                    "payload": {
+                        "doc_id": m.document_id,
+                        "fact": m.statement,
+                        "kind": m.kind,
+                        "is_latest": m.is_latest,
+                        "needs_review": m.needs_review,
+                        "supersedes": m.supersedes,
+                        "extends": m.extends,
+                        "valid_until": m.valid_until,
+                        "captured_at": m.learned_at,
+                        "container_tag": m.container_tag,
+                    },
+                }));
+            }
+            self.store
+                .upsert(&cfg.facts_collection, fact_points.clone())
+                .await?;
+        }
+        Ok(RebuildStats {
+            chunks: n_chunks,
+            memories: fact_points.len(),
+        })
+    }
+
     /// One row per distinct document in a namespace: `(doc_id, title, source,
     /// reference, captured_at)`. Built by scrolling the chunks collection and
     /// deduping by `doc_id`. This is UltraMem's document registry — it has no
@@ -3133,6 +3223,71 @@ mod tests {
             assert_eq!(db.document_count(), 2);
             // Other tenant's doc was not migrated into "t".
             assert!(db.get_document("d3", "t").await.unwrap().is_none());
+        });
+    }
+
+    /// Phase A Task 8: recoverability. After backfilling to Postgres, dropping
+    /// the Qdrant collections (simulated data loss) and rebuilding from PG
+    /// restores the chunk + fact points, ids preserved. Offline.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn rebuild_recovers_qdrant_from_pg() {
+        use crate::db::mock::MockDb;
+        use crate::providers::mock::{MemStore, MockEmbedder};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = EngineCfg::default();
+            cfg.chunks_collection = "c".into();
+            cfg.facts_collection = "f".into();
+            let store = Arc::new(MemStore::new());
+            let db = Arc::new(MockDb::new());
+            let engine = MemoryEngine::new(cfg)
+                .with_store(store.clone())
+                .with_embedder(Arc::new(MockEmbedder { dim: 8 }))
+                .with_db(db.clone());
+            store
+                .upsert(
+                    "c",
+                    vec![
+                        json!({"id":"ch1","vector":[0.0],"payload":{"doc_id":"d1","chunk_index":0,"content":"alpha","title":"D1","source":"api","reference":"","captured_at":1000,"container_tag":"t"}}),
+                        json!({"id":"ch2","vector":[0.0],"payload":{"doc_id":"d1","chunk_index":1,"content":"beta","title":"D1","source":"api","reference":"","captured_at":1000,"container_tag":"t"}}),
+                        json!({"id":"ch3","vector":[0.0],"payload":{"doc_id":"d2","chunk_index":0,"content":"gamma","title":"D2","source":"api","reference":"","captured_at":2000,"container_tag":"t"}}),
+                    ],
+                )
+                .await
+                .unwrap();
+            store
+                .upsert(
+                    "f",
+                    vec![
+                        json!({"id":"m1","vector":[0.0],"payload":{"doc_id":"d1","fact":"the user likes X","kind":"preference","is_latest":true,"container_tag":"t","captured_at":1000}}),
+                        json!({"id":"m2","vector":[0.0],"payload":{"doc_id":"d2","fact":"the user likes Y","kind":"claim","is_latest":true,"container_tag":"t","captured_at":2000}}),
+                    ],
+                )
+                .await
+                .unwrap();
+            // Populate the source of truth, then simulate losing Qdrant.
+            engine.backfill_to_pg("t").await.unwrap();
+            store.delete_collection("c").await.unwrap();
+            store.delete_collection("f").await.unwrap();
+            assert_eq!(store.count("c"), 0);
+            assert_eq!(store.count("f"), 0);
+
+            // Rebuild the index from Postgres.
+            let stats = engine.rebuild_index_from_pg("t").await.unwrap();
+            assert_eq!((stats.chunks, stats.memories), (3, 2));
+            assert_eq!(store.count("c"), 3, "chunks rebuilt from PG");
+            assert_eq!(store.count("f"), 2, "facts rebuilt from PG");
+            // Ids are preserved (rebuild is a repair, not a re-mint).
+            let ids: Vec<String> = store
+                .scroll_all("c", None, 100)
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|p| p["id"].as_str().map(String::from))
+                .collect();
+            assert!(ids.contains(&"ch1".to_string()));
+            assert!(ids.contains(&"ch3".to_string()));
         });
     }
 
