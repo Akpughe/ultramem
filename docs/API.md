@@ -162,6 +162,13 @@ searchable vector is erased before the relational row, so a forgotten fact can't
 resurrected by a later index rebuild, and a mid-way failure is retry-safe. This is the
 fact-level counterpart to document-level `DELETE /v1/memories/:id`.
 
+### `GET /v1/export?container_tag=…` — data portability (requires Postgres)
+Export everything held about a namespace — its `documents` and distilled `memories` —
+from the source of truth, scoped to the caller. The portability counterpart to
+`DELETE /v1/facts/:id` (erasure): hand a user everything you know about them, then forget
+it. Bounded (up to 100k of each); the operation is audited. Returns
+`{ container_tag, documents: [ { id, source, title, reference, captured_at } ], memories: [ { id, kind, statement, confidence, is_latest, document_id, learned_at } ] }`.
+
 ### `POST /v1/memories/:id/promote` — share into a company scope (requires Postgres)
 Copy a memory from the caller's own scope into a shared **scope** it holds the `promote`
 (or `admin`) capability on. Body: `{ "to_scope": "team_eng", "container_tag": "user_a" }`
