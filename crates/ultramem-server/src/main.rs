@@ -70,6 +70,13 @@ async fn main() {
             ),
         }
     }
+    // Task 2b: keep original uploads in object storage when configured.
+    if let Some(dir) = &cfg.blob_dir {
+        engine = engine.with_blob_store(std::sync::Arc::new(ultramem_core::LocalFsBlobStore::new(
+            dir,
+        )));
+        println!("[ultramem] original uploads stored under {dir}");
+    }
     if should_fail_fast_on_pg(cfg.pg_url.is_some(), pg_attached, pg_required) {
         eprintln!(
             "[ultramem] FATAL: ULTRAMEM_PG_REQUIRED=1 but the Postgres source of truth could not \

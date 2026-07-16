@@ -26,6 +26,6 @@ pub use engine::{
 };
 pub use llm::{LlmClient, ResolvedModel};
 pub use providers::{
-    EmbedTask, Embedder, JinaEmbedder, JinaReranker, Llm, MistralOcr, Ocr, OpenAiEmbedder,
-    QdrantStore, Reranker, VectorStore,
+    BlobStore, EmbedTask, Embedder, JinaEmbedder, JinaReranker, Llm, LocalFsBlobStore, MistralOcr,
+    Ocr, OpenAiEmbedder, QdrantStore, Reranker, VectorStore,
 };
