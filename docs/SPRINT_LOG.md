@@ -11,6 +11,17 @@ entry records what changed, what was verified, and what the next sprint is.
 
 ---
 
+## 10/10 compliance / observability
+
+- **Data export / portability** (branch `feat-export`) — `GET /v1/export` dumps a
+  namespace's documents + distilled memories from the Postgres source of truth,
+  scoped and audited. The portability counterpart to fact-level `forget` (erasure);
+  composes existing `list_documents` + `memories_for_tag` (no new Db surface),
+  bounded to 100k of each. Leak test proves another tenant's data never appears;
+  empty for unknown tags; unavailable without a relational store. `docs/API.md`.
+
+---
+
 ## 9/10 temporal — bitemporal correctness (IN PROGRESS)
 
 - **9a — transaction-time `as_of`** (branch `temporal-9a-as-of`) — point-in-time

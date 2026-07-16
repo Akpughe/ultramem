@@ -1687,6 +1687,26 @@ impl MemoryEngine {
         db.aliases_for_tag(tag).await.unwrap_or_default()
     }
 
+    /// Data portability: export a namespace's full contents from the relational
+    /// source of truth — its documents and its distilled memories. Bounded (up to
+    /// 100k of each). Scoped to `tag`; requires a relational store. The compliance
+    /// counterpart to [`Self::forget_memory`] (right-to-erasure) — the operator can
+    /// hand a user everything held about them, then forget it.
+    pub async fn export_tag(
+        &self,
+        tag: &str,
+    ) -> Result<(Vec<crate::db::DocumentRow>, Vec<crate::db::MemoryRow>), String> {
+        let Some(db) = &self.db else {
+            return Err("export requires a relational store (set ULTRAMEM_PG_URL)".into());
+        };
+        const CAP: i64 = 100_000;
+        // `before = None` + a high cap returns the whole namespace in one shot
+        // (newest-first), avoiding a non-unique-cursor pagination boundary bug.
+        let documents = db.list_documents(tag, None, CAP).await?;
+        let memories = db.memories_for_tag(tag, CAP).await?;
+        Ok((documents, memories))
+    }
+
     /// Whether a relational source of truth is attached (jobs/provenance require it).
     pub fn has_db(&self) -> bool {
         self.db.is_some()
@@ -4364,6 +4384,77 @@ mod pipeline_tests {
                 MemoryEngine::new(EngineCfg::default()).with_store(Arc::new(MemStore::new()));
             assert_eq!(bare.resolve_entity("acme", "J. Smith").await, "J. Smith");
             assert!(bare.alias_add("acme", "a", "b").await.is_err());
+        });
+    }
+
+    /// 10/10 feature — data portability. Export returns a namespace's documents and
+    /// memories from the source of truth, scoped (another tenant's data never leaks
+    /// in), and is unavailable without a relational store. Offline.
+    #[test]
+    fn export_returns_scoped_documents_and_memories() {
+        use crate::db::mock::MockDb;
+        use crate::db::{Db, DocumentRow, MemoryRow};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = Arc::new(MockDb::new());
+            let engine = MemoryEngine::new(EngineCfg::default())
+                .with_store(Arc::new(crate::providers::mock::MemStore::new()))
+                .with_db(db.clone());
+
+            let doc = |id: &str, tag: &str, at: i64| DocumentRow {
+                id: id.into(),
+                container_tag: tag.into(),
+                source: "api".into(),
+                title: format!("doc {id}"),
+                reference: String::new(),
+                content_hash: None,
+                canonical_url: None,
+                blob_key: None,
+                captured_at: at,
+                processing_state: "done".into(),
+                created_at: at,
+            };
+            let mem = |id: &str, tag: &str| MemoryRow {
+                id: id.into(),
+                container_tag: tag.into(),
+                kind: "fact".into(),
+                statement: format!("stmt {id}"),
+                confidence: None,
+                is_latest: true,
+                needs_review: false,
+                supersedes: None,
+                superseded_by: None,
+                superseded_at: None,
+                extends: None,
+                event_from: None,
+                valid_until: None,
+                learned_at: 1,
+                document_id: "d".into(),
+                created_at: 1,
+            };
+            db.insert_document(&doc("d1", "alice", 10)).await.unwrap();
+            db.insert_document(&doc("d2", "alice", 20)).await.unwrap();
+            db.insert_document(&doc("d3", "bob", 30)).await.unwrap();
+            db.insert_memories(&[mem("m1", "alice"), mem("m2", "bob")])
+                .await
+                .unwrap();
+
+            let (docs, mems) = engine.export_tag("alice").await.unwrap();
+            let doc_ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
+            assert!(doc_ids.contains(&"d1") && doc_ids.contains(&"d2"));
+            assert!(
+                !doc_ids.contains(&"d3"),
+                "LEAK: exported another tenant's document"
+            );
+            assert_eq!(mems.len(), 1);
+            assert_eq!(mems[0].id, "m1", "LEAK: exported another tenant's memory");
+
+            // Unknown namespace → empty; no relational store → unavailable.
+            let (ed, em) = engine.export_tag("nobody").await.unwrap();
+            assert!(ed.is_empty() && em.is_empty());
+            let bare = MemoryEngine::new(EngineCfg::default())
+                .with_store(Arc::new(crate::providers::mock::MemStore::new()));
+            assert!(bare.export_tag("alice").await.is_err());
         });
     }
 }

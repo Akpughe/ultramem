@@ -118,6 +118,7 @@ async fn main() {
         .route("/v1/memories/:id/promote", post(promote_memory))
         .route("/v1/facts/:id", axum::routing::delete(forget_fact))
         .route("/v1/memories/as_of", get(memories_as_of))
+        .route("/v1/export", get(export))
         .route("/v1/entities/alias", post(add_alias))
         .route("/v1/entities/aliases", get(list_aliases))
         .route("/v1/entities/resolve", get(resolve_entity))
@@ -649,6 +650,55 @@ async fn job_status(
     match state.engine.job_get(&id, &tag).await {
         Some(job) => Json(job).into_response(),
         None => not_found(),
+    }
+}
+
+// ── data export / portability (10/10 compliance) ─────────────────────────────
+/// `GET /v1/export?container_tag=…` — export everything held about a namespace
+/// (documents + distilled memories) from the source of truth. The portability
+/// counterpart to `DELETE /v1/facts/:id` (erasure). Scoped; requires Postgres.
+async fn export(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Query(q): Query<TagQuery>,
+) -> Response {
+    let tag = match resolve_tag(&ctx, &q.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
+    match state.engine.export_tag(&tag).await {
+        Ok((docs, mems)) => {
+            state.engine.audit(&tag, "export", None).await;
+            let documents: Vec<Value> = docs
+                .into_iter()
+                .map(|d| {
+                    json!({
+                        "id": d.id,
+                        "source": d.source,
+                        "title": d.title,
+                        "reference": d.reference,
+                        "captured_at": d.captured_at,
+                    })
+                })
+                .collect();
+            let memories: Vec<Value> = mems
+                .into_iter()
+                .map(|m| {
+                    json!({
+                        "id": m.id,
+                        "kind": m.kind,
+                        "statement": m.statement,
+                        "confidence": m.confidence,
+                        "is_latest": m.is_latest,
+                        "document_id": m.document_id,
+                        "learned_at": m.learned_at,
+                    })
+                })
+                .collect();
+            Json(json!({ "container_tag": tag, "documents": documents, "memories": memories }))
+                .into_response()
+        }
+        Err(e) => err(e),
     }
 }
 
