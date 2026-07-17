@@ -400,6 +400,29 @@ impl Db for PgDb {
         Ok(row.get::<i64, _>("n"))
     }
 
+    async fn audit_list(&self, container_tag: &str, limit: i64) -> Result<Vec<AuditEvent>, String> {
+        let rows = sqlx::query(
+            "select actor, container_tag, action, target_id, request_id, ts \
+             from audit_events where container_tag = $1 order by ts desc limit $2",
+        )
+        .bind(container_tag)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("audit_list failed: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AuditEvent {
+                actor: r.get("actor"),
+                container_tag: r.get("container_tag"),
+                action: r.get("action"),
+                target_id: r.get("target_id"),
+                request_id: r.get("request_id"),
+                ts: r.get("ts"),
+            })
+            .collect())
+    }
+
     async fn chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRow>, String> {
         let rows = sqlx::query(
             "select id, document_id, chunk_index, content, embed_model, dim \

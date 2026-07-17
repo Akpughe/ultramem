@@ -162,6 +162,12 @@ searchable vector is erased before the relational row, so a forgotten fact can't
 resurrected by a later index rebuild, and a mid-way failure is retry-safe. This is the
 fact-level counterpart to document-level `DELETE /v1/memories/:id`.
 
+### `GET /v1/audit?container_tag=…&limit=100` — forensic audit trail (requires Postgres)
+The read side of the audit log: who did what, when, in a namespace — newest first. Every
+mutating operation (ingest, delete, reindex, promote, forget, export, alias, ACL grant/revoke)
+appends an `audit_events` row; this endpoint returns them as
+`{ events: [ { actor, action, target_id, request_id, ts } ] }`. Scoped to the caller.
+
 ### `GET /v1/export?container_tag=…` — data portability (requires Postgres)
 Export everything held about a namespace — its `documents` and distilled `memories` —
 from the source of truth, scoped to the caller. The portability counterpart to

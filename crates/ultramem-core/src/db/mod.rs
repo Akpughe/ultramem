@@ -206,6 +206,9 @@ pub trait Db: Send + Sync {
     async fn insert_audit(&self, event: &AuditEvent) -> Result<(), String>;
     /// Count audit events for a namespace (for tests/inspection).
     async fn audit_count(&self, container_tag: &str) -> Result<i64, String>;
+    /// The audit trail for a namespace, newest first, capped at `limit` — the
+    /// read side of the forensic log (who did what, when).
+    async fn audit_list(&self, container_tag: &str, limit: i64) -> Result<Vec<AuditEvent>, String>;
     /// All chunk rows for a document (ordered by `chunk_index`) — for rebuilding
     /// the vector index from the source of truth.
     async fn chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRow>, String>;
