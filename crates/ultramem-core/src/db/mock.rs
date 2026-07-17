@@ -218,6 +218,19 @@ impl Db for MockDb {
             .filter(|e| e.container_tag.as_deref() == Some(container_tag))
             .count() as i64)
     }
+    async fn audit_list(&self, container_tag: &str, limit: i64) -> Result<Vec<AuditEvent>, String> {
+        let mut rows: Vec<AuditEvent> = self
+            .audits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.container_tag.as_deref() == Some(container_tag))
+            .cloned()
+            .collect();
+        rows.sort_by_key(|e| std::cmp::Reverse(e.ts)); // newest first
+        rows.truncate(limit.max(0) as usize);
+        Ok(rows)
+    }
     async fn chunks_for_document(&self, document_id: &str) -> Result<Vec<ChunkRow>, String> {
         let mut rows: Vec<ChunkRow> = self
             .chunks

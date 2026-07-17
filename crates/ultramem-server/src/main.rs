@@ -119,6 +119,7 @@ async fn main() {
         .route("/v1/facts/:id", axum::routing::delete(forget_fact))
         .route("/v1/memories/as_of", get(memories_as_of))
         .route("/v1/export", get(export))
+        .route("/v1/audit", get(audit_log))
         .route("/v1/entities/alias", post(add_alias))
         .route("/v1/entities/aliases", get(list_aliases))
         .route("/v1/entities/resolve", get(resolve_entity))
@@ -651,6 +652,43 @@ async fn job_status(
         Some(job) => Json(job).into_response(),
         None => not_found(),
     }
+}
+
+// ── audit trail (read side) ──────────────────────────────────────────────────
+#[derive(Deserialize)]
+struct AuditQuery {
+    container_tag: Option<String>,
+    limit: Option<i64>,
+}
+
+/// `GET /v1/audit?container_tag=…&limit=100` — the forensic audit trail for a
+/// namespace (who did what, when), newest first. Requires Postgres.
+async fn audit_log(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<TenantCtx>,
+    Query(q): Query<AuditQuery>,
+) -> Response {
+    let tag = match resolve_tag(&ctx, &q.container_tag) {
+        Ok(t) => t,
+        Err(()) => return forbidden(),
+    };
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let events: Vec<Value> = state
+        .engine
+        .audit_list(&tag, limit)
+        .await
+        .into_iter()
+        .map(|e| {
+            json!({
+                "actor": e.actor,
+                "action": e.action,
+                "target_id": e.target_id,
+                "request_id": e.request_id,
+                "ts": e.ts,
+            })
+        })
+        .collect();
+    Json(json!({ "events": events })).into_response()
 }
 
 // ── data export / portability (10/10 compliance) ─────────────────────────────

@@ -13,6 +13,11 @@ entry records what changed, what was verified, and what the next sprint is.
 
 ## 10/10 compliance / observability
 
+- **Audit trail — read side** (branch `feat-audit-read`) — `GET /v1/audit` returns a
+  namespace's forensic log (who did what, when), newest first. `Db::audit_list`
+  (PG + Mock) + engine `audit_list` wrapper complete the previously write-only trail
+  into a readable observability surface. Leak test proves scoping + newest-first
+  ordering; empty without a Db. `docs/API.md`.
 - **Data export / portability** (branch `feat-export`) — `GET /v1/export` dumps a
   namespace's documents + distilled memories from the Postgres source of truth,
   scoped and audited. The portability counterpart to fact-level `forget` (erasure);

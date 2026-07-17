@@ -1772,6 +1772,15 @@ impl MemoryEngine {
         }
     }
 
+    /// Read the forensic audit trail for a namespace (newest first, capped). The
+    /// read side of [`Self::audit`]; empty without a relational store.
+    pub async fn audit_list(&self, tag: &str, limit: i64) -> Vec<crate::db::AuditEvent> {
+        let Some(db) = &self.db else {
+            return Vec::new();
+        };
+        db.audit_list(tag, limit).await.unwrap_or_default()
+    }
+
     /// Expose the search plan so callers can route enumeration ("list all
     /// files from last week") to the structured timeline instead of semantic
     /// search, which only ever returns a similarity top-K.
@@ -4455,6 +4464,53 @@ mod pipeline_tests {
             let bare = MemoryEngine::new(EngineCfg::default())
                 .with_store(Arc::new(crate::providers::mock::MemStore::new()));
             assert!(bare.export_tag("alice").await.is_err());
+        });
+    }
+
+    /// 10/10 observability — the audit trail is readable, namespace-scoped, and
+    /// newest-first. Complements the write side already exercised by
+    /// `audit_records_scoped_events`. Offline.
+    #[test]
+    fn audit_list_is_scoped_and_newest_first() {
+        use crate::db::mock::MockDb;
+        use crate::providers::mock::MemStore;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = Arc::new(MockDb::new());
+            let engine = MemoryEngine::new(EngineCfg::default())
+                .with_store(Arc::new(MemStore::new()))
+                .with_db(db.clone());
+
+            // Three mutations in alice's namespace, one in bob's.
+            engine.audit("alice", "ingest", Some("d1")).await;
+            engine.audit("alice", "promote", Some("m9")).await;
+            engine.audit("alice", "forget", Some("m1")).await;
+            engine.audit("bob", "ingest", Some("d2")).await;
+
+            let events = engine.audit_list("alice", 100).await;
+            assert_eq!(events.len(), 3, "only alice's events");
+            assert!(
+                events
+                    .iter()
+                    .all(|e| e.container_tag.as_deref() == Some("alice")),
+                "LEAK: another namespace's audit event surfaced"
+            );
+            // Newest first (timestamps are monotonic within the run).
+            assert!(events[0].ts >= events[1].ts && events[1].ts >= events[2].ts);
+            // The set of actions recorded is exactly what we did.
+            let actions: std::collections::HashSet<&str> =
+                events.iter().map(|e| e.action.as_str()).collect();
+            assert!(
+                actions.contains("ingest")
+                    && actions.contains("promote")
+                    && actions.contains("forget")
+            );
+
+            // limit caps the page; no Db → empty (not an error).
+            assert_eq!(engine.audit_list("alice", 2).await.len(), 2);
+            let bare =
+                MemoryEngine::new(EngineCfg::default()).with_store(Arc::new(MemStore::new()));
+            assert!(bare.audit_list("alice", 100).await.is_empty());
         });
     }
 }
